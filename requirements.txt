@@ -1,0 +1,45 @@
+# === Core ===
+python>=3.10
+pydantic>=2.0
+
+# === SEC EDGAR Downloader ===
+sec-edgar-downloader>=4.0
+
+# === PDF / Document Parsing ===
+pdfplumber>=0.10.0
+markdownify>=0.11.0
+unstructured[pdf,html]>=0.12.0
+
+# === Embeddings & Sentence Transformers ===
+sentence-transformers>=2.2.0
+torch>=2.0.0
+
+# === Vector Store (LanceDB embedded) ===
+lancedb>=0.8.0
+
+# === Sparse Retrieval (BM25) ===
+rank-bm25>=0.2.2
+
+# === Graph Database (Kùzu embedded) ===
+kuzu>=0.6.0
+
+# === LLM / Inference (Groq + LangChain) ===
+groq>=0.5.0
+langchain>=0.1.0
+langchain-groq>=0.1.0
+langchain-community>=0.1.0
+
+# === LangGraph (orchestration) ===
+langgraph>=0.1.0
+
+# === Cross-Encoder Reranker ===
+sentence-transformers>=2.2.0  # BGE-Reranker via cross-encoder
+
+# === Evaluation (RAGAS) ===
+ragas>=0.1.0
+datasets>=2.15.0
+
+# === Utilities ===
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+orjson>=3.9.0

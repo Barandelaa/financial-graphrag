@@ -1,0 +1,137 @@
+[
+  {
+    "question": "What was Apple's total net revenue for fiscal year 2023?",
+    "ground_truth": "Apple's total net revenue for fiscal year 2023 was $383.3 billion.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "AAPL",
+    "expected_year": 2023,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What are the principal risk factors disclosed by Microsoft in Item 1A of its 2023 10-K?",
+    "ground_truth": "Microsoft discloses risks including competition in cloud computing, cybersecurity threats, economic uncertainty, regulatory changes, intellectual property challenges, and dependence on third-party suppliers.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "MSFT",
+    "expected_year": 2023,
+    "expected_section": "Item 1A"
+  },
+  {
+    "question": "How much did Amazon's operating income change from 2022 to 2023?",
+    "ground_truth": "Amazon's operating income increased from $12.2 billion in 2022 to $36.9 billion in 2023, a significant improvement driven by cost-cutting measures and AWS growth.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "AMZN",
+    "expected_year": 2023,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What business segments does Tesla report in its 2023 10-K?",
+    "ground_truth": "Tesla reports two operating segments: Automotive and Energy Generation & Storage.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "TSLA",
+    "expected_year": 2023,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What was NVIDIA's diluted EPS for fiscal year 2024?",
+    "ground_truth": "NVIDIA's diluted earnings per share for fiscal year 2024 was $11.93.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "NVDA",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "How does Google (Alphabet) describe competition in its 2023 10-K?",
+    "ground_truth": "Alphabet faces competition in search, advertising, cloud computing, and AI from companies including Microsoft, Amazon, Meta, and various AI startups. Competition is described as intense and based on innovation, user experience, and pricing.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "GOOGL",
+    "expected_year": 2023,
+    "expected_section": "Item 1A"
+  },
+  {
+    "question": "What was Meta Platforms' revenue from its Family of Apps segment in 2023?",
+    "ground_truth": "Meta's Family of Apps segment generated $131.9 billion in revenue for fiscal year 2023.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "META",
+    "expected_year": 2023,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What risk factors does Boeing identify regarding its supply chain in its 2023 10-K?",
+    "ground_truth": "Boeing identifies risks related to supplier concentration, single-source suppliers, supply chain disruptions, raw material availability, and the financial health of key suppliers as material risk factors.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "BA",
+    "expected_year": 2023,
+    "expected_section": "Item 1A"
+  },
+  {
+    "question": "How does JPMorgan Chase describe macroeconomic conditions affecting its business in 2023?",
+    "ground_truth": "JPMorgan Chase cites inflation, rising interest rates, geopolitical tensions, potential recession risks, and regulatory changes as key macroeconomic conditions affecting its business in 2023.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "JPM",
+    "expected_year": 2023,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What was ExxonMobil's total revenue for fiscal year 2023?",
+    "ground_truth": "ExxonMobil's total revenue for fiscal year 2023 was $344.6 billion.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "XOM",
+    "expected_year": 2023,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What segments does Johnson & Johnson operate in according to its 2023 10-K?",
+    "ground_truth": "Johnson & Johnson operates in three segments: Innovative Medicine (pharmaceuticals), MedTech (medical devices), and (post-separation) the remaining business structure focuses on Innovative Medicine and MedTech.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "JNJ",
+    "expected_year": 2023,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "What research and development expenses did Pfizer report for 2023?",
+    "ground_truth": "Pfizer reported R&D expenses of $13.4 billion for fiscal year 2023.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "PFE",
+    "expected_year": 2023,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What are Walmart's primary risk factors related to its retail operations?",
+    "ground_truth": "Walmart's primary risk factors include economic conditions affecting consumer spending, competition from e-commerce and other retailers, supply chain disruptions, cybersecurity risks, regulatory compliance, and changes in consumer preferences.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "WMT",
+    "expected_year": 2024,
+    "expected_section": "Item 1A"
+  },
+  {
+    "question": "How does Berkshire Hathaway describe its insurance operations' performance in 2023?",
+    "ground_truth": "Berkshire Hathaway's insurance operations, including GEICO and Berkshire Hathaway Reinsurance, reported strong underwriting results in 2023 driven by higher premium volumes, improved pricing, and favorable loss reserve development.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "BRK.B",
+    "expected_year": 2023,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What was Coca-Cola's net operating revenue for fiscal year 2023?",
+    "ground_truth": "Coca-Cola's net operating revenue for fiscal year 2023 was $45.8 billion.",
+    "reference_contexts": [
+    ],
+    "expected_ticker": "KO",
+    "expected_year": 2023,
+    "expected_section": "Item 7"
+  }
+]
