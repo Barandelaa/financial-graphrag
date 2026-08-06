@@ -12,6 +12,19 @@ from sentence_transformers import SentenceTransformer
 logger = logging.getLogger(__name__)
 
 
+def _detect_device(preferred: str) -> str:
+    if preferred and preferred != "cpu":
+        return preferred
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 @dataclass
 class DenseSearchResult:
     chunk_id: str
@@ -32,7 +45,7 @@ class DenseRetriever:
         self.model_name = model_name
         self.table_name = table_name
         self._embedder: Optional[SentenceTransformer] = None
-        self._device = device
+        self._device = _detect_device(device)
 
         Path(db_uri).parent.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(self.db_uri)
@@ -40,9 +53,13 @@ class DenseRetriever:
     @property
     def embedder(self) -> SentenceTransformer:
         if self._embedder is None:
-            self._embedder = SentenceTransformer(
-                self.model_name, device=self._device
-            )
+            from src.env import get_hf_token
+
+            kwargs = {"device": self._device}
+            token = get_hf_token()
+            if token:
+                kwargs["token"] = token
+            self._embedder = SentenceTransformer(self.model_name, **kwargs)
         return self._embedder
 
     def embed_texts(self, texts: List[str]) -> np.ndarray:
@@ -56,6 +73,10 @@ class DenseRetriever:
         chunks: List[dict],
         persist: bool = True,
     ) -> None:
+        if not chunks:
+            logger.info("No chunks to index")
+            return
+
         texts = [c["text"] for c in chunks]
         embeddings = self.embed_texts(texts)
 
@@ -72,12 +93,44 @@ class DenseRetriever:
                 **chunk.get("metadata", {}),
             })
 
+        if self.table_name in self._db.table_names():
+            existing_ids = self._existing_chunk_ids()
+            new_records = [
+                r for r in records if r["chunk_id"] not in existing_ids
+            ]
+            if new_records:
+                self._db.open_table(self.table_name).add(new_records)
+                logger.info(
+                    "Added %d new chunks to existing LanceDB table '%s'",
+                    len(new_records),
+                    self.table_name,
+                )
+            else:
+                logger.info(
+                    "All %d chunks already indexed in '%s'; skipping",
+                    len(records),
+                    self.table_name,
+                )
+            return
+
         table = self._db.create_table(
             self.table_name, data=records, mode="overwrite"
         )
         logger.info(
             "Indexed %d chunks in LanceDB table '%s'", len(records), self.table_name
         )
+
+    def _existing_chunk_ids(self) -> set:
+        try:
+            table = self._db.open_table(self.table_name)
+        except Exception:
+            return set()
+        try:
+            df = table.to_pandas()
+            return set(df["chunk_id"]) if len(df) else set()
+        except Exception as exc:
+            logger.warning("Could not read existing chunk ids: %s", exc)
+            return set()
 
     def search(
         self,
@@ -114,4 +167,7 @@ class DenseRetriever:
         ]
 
     def close(self) -> None:
-        self._db.close()
+        try:
+            self._db.close()
+        except AttributeError:
+            logger.debug("LanceDB connection has no close() method; skipping")

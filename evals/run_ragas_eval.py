@@ -12,15 +12,19 @@ from datasets import Dataset
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 
-from ragas import evaluate
-from ragas.metrics import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from evals.ragas_compat import install as install_ragas_compat  # noqa: E402
+
+install_ragas_compat()
+
+from ragas import evaluate  # noqa: E402
+from ragas.metrics import (  # noqa: E402
     answer_relevancy,
     context_precision,
     context_recall,
     faithfulness,
 )
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.pipeline import FinancialGraphRAGPipeline  # noqa: E402
 
@@ -139,10 +143,17 @@ class RagasEvaluator:
 
         scores = self._compute_ragas(results)
 
-        for r in results:
+        valid_idx = [
+            i for i, r in enumerate(results) if r.answer and r.contexts
+        ]
+        for idx, r in enumerate(results):
+            if idx not in valid_idx:
+                r.scores = {m: 0.0 for m in METRIC_NAMES}
+                continue
+            pos = valid_idx.index(idx)
             r.scores = {
-                m: scores[m][i] if scores[m] else 0.0
-                for i, m in enumerate(METRIC_NAMES)
+                m: scores[m][pos] if scores[m] else 0.0
+                for m in METRIC_NAMES
             }
 
         if output_path:
@@ -256,6 +267,7 @@ def main(
     skip_ingest: bool = False,
     tickers: Optional[List[str]] = None,
     years: Optional[List[int]] = None,
+    max_samples: Optional[int] = None,
 ) -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -271,6 +283,8 @@ def main(
                 pipeline.ingest_and_index(ticker, year)
 
     samples = load_test_dataset(dataset_path)
+    if max_samples is not None:
+        samples = samples[:max_samples]
 
     evaluator = RagasEvaluator(pipeline=pipeline, llm=llm, embeddings=embeddings)
     evaluator.run(samples=samples, output_path=output_path)
@@ -279,12 +293,37 @@ def main(
 
 
 if __name__ == "__main__":
-    from langchain_groq import ChatGroq
+    import argparse
 
-    llm = ChatGroq(model="mixtral-8x7b-32768", temperature=0.0)
+    from src.llm_factory import create_embeddings, create_llm
+
+    parser = argparse.ArgumentParser(
+        description="Run RAGAS evaluation on the financial GraphRAG pipeline"
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=None,
+        help="Limit evaluation to the first N samples",
+    )
+    parser.add_argument(
+        "--dataset",
+        default="evals/test_dataset.json",
+        help="Path to the test dataset JSON",
+    )
+    parser.add_argument(
+        "--output",
+        default="evals/results/eval_report.json",
+        help="Path for the evaluation report JSON",
+    )
+    args = parser.parse_args()
+
+    llm = create_llm()
 
     main(
         llm=llm,
-        dataset_path="evals/test_dataset.json",
-        output_path="evals/results/eval_report.json",
+        embeddings=create_embeddings(),
+        dataset_path=args.dataset,
+        output_path=args.output,
+        max_samples=args.samples,
     )

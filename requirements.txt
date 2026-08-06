@@ -1,9 +1,8 @@
 # === Core ===
-python>=3.10
 pydantic>=2.0
 
 # === SEC EDGAR Downloader ===
-sec-edgar-downloader>=4.0
+sec-edgar-downloader>=5.0
 
 # === PDF / Document Parsing ===
 pdfplumber>=0.10.0
@@ -25,8 +24,11 @@ kuzu>=0.6.0
 
 # === LLM / Inference (Groq + LangChain) ===
 groq>=0.5.0
+ollama>=0.3.0
 langchain>=0.1.0
 langchain-groq>=0.1.0
+langchain-ollama>=0.2.0
+langchain-huggingface>=0.1.0
 langchain-community>=0.1.0
 
 # === LangGraph (orchestration) ===
@@ -38,6 +40,10 @@ sentence-transformers>=2.2.0  # BGE-Reranker via cross-encoder
 # === Evaluation (RAGAS) ===
 ragas>=0.1.0
 datasets>=2.15.0
+
+# === Graph community detection (Leiden) ===
+leidenalg>=0.10.0
+python-igraph>=0.11.0
 
 # === Utilities ===
 python-dotenv>=1.0.0

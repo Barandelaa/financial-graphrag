@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import kuzu
 from langchain_core.language_models import BaseChatModel
@@ -12,6 +13,7 @@ from src.graph.extractor import (
     EntityType,
     FinancialTriplet,
     RelationType,
+    Triplet,
     TripletExtractor,
 )
 from src.graph.schema import GraphConfig, GraphSchema
@@ -49,37 +51,145 @@ class GraphPipeline:
         self,
         llm: BaseChatModel,
         graph_config: Optional[GraphConfig] = None,
+        triplets_cache_dir: str | Path = "data/processed_chunks",
     ) -> None:
         self.llm = llm
         self.config = graph_config or GraphConfig()
         self.schema = GraphSchema(self.config)
         self.extractor = TripletExtractor(llm=llm)
+        self.triplets_cache_dir = Path(triplets_cache_dir)
 
     def process_chunks(self, chunks: List[Chunk]) -> List[FinancialTriplet]:
-        table_prefix = _ensure_tables_string
         all_triplets: List[FinancialTriplet] = []
 
         conn = self.schema.connection
 
+        groups: Dict[tuple[str, int], List[Chunk]] = {}
         for chunk in chunks:
-            triplets = self.extractor.extract_from_chunk(
-                chunk_text=chunk.text,
-                ticker=chunk.company_ticker,
-                year=chunk.fiscal_year,
-                section_id=chunk.section_id,
-                chunk_id=chunk.chunk_id,
-            )
+            groups.setdefault(
+                (chunk.company_ticker, chunk.fiscal_year), []
+            ).append(chunk)
 
-            self._upsert_chunk(conn, chunk)
-            self._upsert_triplets(conn, chunk, triplets)
-            all_triplets.extend(triplets)
+        for (ticker, year), group_chunks in groups.items():
+            cache = self._load_triplets_cache(ticker, year)
+            new_entries: Dict[str, List[FinancialTriplet]] = {}
+
+            for chunk in group_chunks:
+                if chunk.chunk_id in cache:
+                    triplets = cache[chunk.chunk_id]
+                    logger.debug(
+                        "Reusing %d cached triplets for chunk %s",
+                        len(triplets),
+                        chunk.chunk_id,
+                    )
+                else:
+                    triplets = self.extractor.extract_from_chunk(
+                        chunk_text=chunk.text,
+                        ticker=chunk.company_ticker,
+                        year=chunk.fiscal_year,
+                        section_id=chunk.section_id,
+                        chunk_id=chunk.chunk_id,
+                    )
+                    new_entries[chunk.chunk_id] = triplets
+
+                self._upsert_chunk(conn, chunk)
+                self._upsert_triplets(conn, chunk, triplets)
+                all_triplets.extend(triplets)
+
+            if new_entries:
+                cache.update(new_entries)
+                self._save_triplets_cache(ticker, year, cache)
+
+            try:
+                conn.execute("CHECKPOINT")
+                logger.info("Graph pipeline: checkpointed Kùzu after %s / %s", ticker, year)
+            except RuntimeError as exc:
+                logger.debug("Kùzu checkpoint skipped: %s", exc)
 
         logger.info(
-            "Graph pipeline: inserted %d triplets from %d chunks",
-            len(all_triplets),
+            "Graph pipeline: processed %d chunks for %d group(s)",
             len(chunks),
+            len(groups),
         )
         return all_triplets
+
+    def _cache_path(self, ticker: str, year: int) -> Path:
+        return self.triplets_cache_dir / f"{ticker}_{year}" / "triplets.json"
+
+    def _load_triplets_cache(
+        self, ticker: str, year: int
+    ) -> Dict[str, List[FinancialTriplet]]:
+        path = self._cache_path(ticker, year)
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except Exception as exc:
+            logger.warning(
+                "Could not read triplets cache %s: %s", path, exc
+            )
+            return {}
+        return {
+            rec["chunk_id"]: self._triplets_from_dict(rec)
+            for rec in records
+        }
+
+    def _save_triplets_cache(
+        self,
+        ticker: str,
+        year: int,
+        cache: Dict[str, List[FinancialTriplet]],
+    ) -> None:
+        path = self._cache_path(ticker, year)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        records = [
+            self._triplet_to_dict(chunk_id, triplets)
+            for chunk_id, triplets in sorted(cache.items())
+        ]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2, ensure_ascii=False)
+        logger.info(
+            "Persisted %d chunk triplets to %s", len(records), path
+        )
+
+    @staticmethod
+    def _triplet_to_dict(
+        chunk_id: str,
+        triplets: List[FinancialTriplet],
+    ) -> dict:
+        meta = triplets[0] if triplets else None
+        return {
+            "chunk_id": chunk_id,
+            "company_ticker": getattr(meta, "company_ticker", ""),
+            "fiscal_year": getattr(meta, "fiscal_year", 0),
+            "section_id": getattr(meta, "section_id", ""),
+            "triplets": [
+                ft.triplet.model_dump(mode="json") for ft in triplets
+            ],
+        }
+
+    @staticmethod
+    def _triplets_from_dict(rec: dict) -> List[FinancialTriplet]:
+        triplets: List[FinancialTriplet] = []
+        for item in rec.get("triplets", []):
+            try:
+                triplets.append(
+                    FinancialTriplet(
+                        triplet=Triplet.model_validate(item),
+                        chunk_id=rec["chunk_id"],
+                        company_ticker=rec.get("company_ticker", ""),
+                        fiscal_year=rec.get("fiscal_year", 0),
+                        section_id=rec.get("section_id", ""),
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Skipping invalid cached triplet for chunk %s: %s",
+                    rec.get("chunk_id"),
+                    exc,
+                )
+        return triplets
 
     def _upsert_chunk(self, conn: kuzu.Connection, chunk: Chunk) -> None:
         conn.execute(

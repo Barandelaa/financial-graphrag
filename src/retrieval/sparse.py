@@ -24,12 +24,24 @@ class SparseRetriever:
         self._bm25: Optional[BM25Okapi] = None
 
     def index_chunks(self, chunks: List[dict]) -> None:
-        self._corpus = chunks
-        tokenized = [
-            self._tokenize(c["text"]) for c in chunks
+        known_ids = {c["chunk_id"] for c in self._corpus}
+        new_chunks = [
+            c for c in chunks if c["chunk_id"] not in known_ids
         ]
-        self._bm25 = BM25Okapi(tokenized)
-        logger.info("Indexed %d chunks for BM25 retrieval", len(chunks))
+
+        if new_chunks:
+            self._corpus.extend(new_chunks)
+            tokenized = [
+                self._tokenize(c["text"]) for c in self._corpus
+            ]
+            self._bm25 = BM25Okapi(tokenized)
+            logger.info(
+                "BM25 added %d new chunks (total corpus: %d)",
+                len(new_chunks),
+                len(self._corpus),
+            )
+        else:
+            logger.info("No new chunks for BM25; corpus unchanged")
 
     def search(
         self,

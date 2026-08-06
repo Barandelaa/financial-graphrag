@@ -18,9 +18,16 @@ GENERATION_PROMPT = ChatPromptTemplate.from_messages(
             "You are a financial analyst assistant. Answer the user's question "
             "using ONLY the provided context from SEC 10-K reports. "
             "For each factual claim, cite the source using the format:\n"
-            "[Source: {ticker} | FY{year} | {section} | chunk: {chunk_id}]\n\n"
-            "If the context does not contain enough information, say so.\n"
-            "Do NOT make up information.",
+            "[Source: TICKER | FY YEAR | SECTION | chunk: CHUNK_ID]\n\n"
+            "STRICT RULES:\n"
+            "- Use ONLY figures, dates and facts explicitly present in the CONTEXT. "
+            "Never invent, round, or recall numbers from memory.\n"
+            "- When a number appears in the context as a table row like "
+            "'Total net sales | $ | 383,285', report it exactly as written.\n"
+            "- If the exact figure asked is NOT in the context, say so explicitly "
+            "instead of guessing.\n"
+            "- If the context does not contain enough information, say so.\n"
+            "- Do NOT make up information.",
         ),
         (
             "human",

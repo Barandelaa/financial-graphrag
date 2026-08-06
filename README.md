@@ -95,7 +95,12 @@ source venv/bin/activate
 # 3. Instalar dependencias
 pip install -r requirements.txt
 
-# 4. Configurar variables de entorno
+# 4. (Opcional) Configurar Ollama local (por defecto)
+#    Instala Ollama desde https://ollama.com y descarga el modelo:
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen2.5:7b
+
+# 5. (Opcional) API key de Groq — solo se usa si Ollama no está disponible
 export GROQ_API_KEY="gsk_..."
 ```
 
@@ -104,10 +109,11 @@ export GROQ_API_KEY="gsk_..."
 ### Desde Python
 
 ```python
-from langchain_groq import ChatGroq
+from src.llm_factory import create_llm
 from src.pipeline import FinancialGraphRAGPipeline
 
-llm = ChatGroq(model="mixtral-8x7b-32768", temperature=0.0)
+# Ollama local (qwen2.5:7b) por defecto; cae a Groq si no está disponible
+llm = create_llm()
 pipeline = FinancialGraphRAGPipeline(llm=llm)
 
 # Ingestar un 10-K
@@ -161,7 +167,7 @@ python evals/run_ragas_eval.py
 | Vector Store | LanceDB (embebido) |
 | Búsqueda Léxica | BM25 (rank-bm25) |
 | Graph DB | Kùzu (embebido) |
-| LLM | Groq API / Ollama |
+| LLM | Ollama (qwen2.5:7b) por defecto · Groq como fallback |
 | Framework | LangChain / LangGraph |
 | Reranker | BGE-Reranker-v2-m3 |
 | Evaluación | RAGAS |

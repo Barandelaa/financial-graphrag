@@ -86,7 +86,7 @@ REL_TABLE_DDL: List[str] = [
 @dataclass
 class GraphConfig:
     db_path: str | Path = "data/graph/kuzu_db"
-    buffer_pool_size: int = 1024**3
+    buffer_pool_size: int = 8 * 1024**3
     max_threads: int = 4
 
 
@@ -98,7 +98,7 @@ class GraphSchema:
         self._db: kuzu.Database = kuzu.Database(
             str(self.db_path),
             buffer_pool_size=config.buffer_pool_size,
-            max_threads=config.max_threads,
+            max_num_threads=config.max_threads,
         )
         self._connection: kuzu.Connection = kuzu.Connection(self._db)
         self._create_schema()

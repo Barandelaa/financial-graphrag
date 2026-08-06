@@ -45,8 +45,21 @@ class IngestionPipeline:
         year: int,
         after_date: Optional[str] = None,
         before_date: Optional[str] = None,
+        use_cache: bool = True,
     ) -> List[Chunk]:
         logger.info("Ingestion pipeline started for %s / %s", ticker, year)
+
+        if use_cache:
+            cached = self._load_cached_chunks(ticker, year)
+            if cached:
+                logger.info(
+                    "Reusing %d cached chunks for %s / %s from %s",
+                    len(cached),
+                    ticker,
+                    year,
+                    self.processed_dir / f"{ticker}_{year}" / "chunks.json",
+                )
+                return cached
 
         files = self.downloader.download(ticker, year, after_date, before_date)
         if not files:
@@ -75,6 +88,25 @@ class IngestionPipeline:
             len(all_chunks),
         )
         return all_chunks
+
+    def _load_cached_chunks(
+        self,
+        ticker: str,
+        year: int,
+    ) -> List[Chunk]:
+        output_path = self.processed_dir / f"{ticker}_{year}" / "chunks.json"
+        if not output_path.exists():
+            return []
+
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+            return [Chunk(**r) for r in records]
+        except Exception as exc:
+            logger.warning(
+                "Failed to load cached chunks from %s: %s", output_path, exc
+            )
+            return []
 
     def _persist_chunks(
         self,

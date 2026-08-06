@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
 from enum import Enum
 from typing import List, Optional
 
@@ -29,7 +31,15 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
             "- impacts_revenue: RiskFactor/MacroEvent -> FinancialMetric\n"
             "- mitigates_risk: BusinessSegment -> RiskFactor\n"
             "- competes_with: Company -> Company\n\n"
-            "Respond ONLY with a JSON array of triplets matching the schema.",
+            "Respond ONLY with a JSON object in the following shape, without extra text:\n"
+            '{{"triplets": [{{"source": {{"name": "..."}}, "relation": "...", '
+            '"target": {{"name": "..."}}}}]}}\n\n'
+            "Rules:\n"
+            "- Use the exact relation names above.\n"
+            "- The source must be the company ticker where the relation is "
+            "Company -> X (e.g. operates_in, reported_metric).\n"
+            "- Only include entities explicitly mentioned in the text.\n"
+            "- Omit relations when the target is unknown.",
         ),
         (
             "human",
@@ -113,7 +123,7 @@ class TripletExtractor:
         llm: BaseChatModel,
         max_retries: int = 2,
     ) -> None:
-        self.llm = llm.with_structured_output(ExtractionResult, method="json_mode")
+        self.llm = llm
         self.max_retries = max_retries
 
     def extract_from_chunk(
@@ -134,9 +144,8 @@ class TripletExtractor:
         last_error: Optional[Exception] = None
         for attempt in range(1 + self.max_retries):
             try:
-                response: ExtractionResult = self.llm.invoke(
-                    EXTRACTION_PROMPT.format_messages(**payload)
-                )
+                raw = self._invoke_json(payload)
+                parsed = self._parse_triplets(raw)
                 return [
                     FinancialTriplet(
                         triplet=t,
@@ -145,7 +154,7 @@ class TripletExtractor:
                         fiscal_year=year,
                         section_id=section_id,
                     )
-                    for t in response.triplets
+                    for t in parsed
                 ]
             except Exception as exc:
                 last_error = exc
@@ -162,3 +171,168 @@ class TripletExtractor:
             last_error,
         )
         return []
+
+    def _invoke_json(self, payload: dict) -> List[dict]:
+        messages = EXTRACTION_PROMPT.format_messages(**payload)
+        try:
+            response = self.llm.invoke(messages)
+        except Exception:
+            structured = self.llm.with_structured_output(
+                ExtractionResult, method="json_mode"
+            )
+            response = structured.invoke(messages)
+
+        content = getattr(response, "content", None)
+        if content is None:
+            raise ValueError("LLM returned no content")
+
+        json_text = self._strip_code_fences(str(content))
+        data = self._loads_json(json_text)
+        if isinstance(data, dict):
+            triplets = data.get("triplets", [])
+        elif isinstance(data, list):
+            triplets = data
+        else:
+            raise ValueError(f"Unexpected JSON shape: {type(data)}")
+
+        return [
+            self._normalize_triplet(item)
+            for item in triplets
+            if isinstance(item, (dict, list))
+        ]
+
+    @staticmethod
+    def _loads_json(json_text: str):
+        try:
+            return json.loads(json_text)
+        except Exception as exc:
+            repaired = TripletExtractor._repair_bare_value_objects(json_text)
+            try:
+                return json.loads(repaired)
+            except Exception:
+                repaired = TripletExtractor._repair_json(repaired)
+                try:
+                    return json.loads(repaired)
+                except Exception:
+                    raise exc
+
+    _BARE_VALUE_OBJECT = re.compile(r'\{\s*("[^"]*")\s*\}')
+
+    @classmethod
+    def _repair_bare_value_objects(cls, text: str) -> str:
+        return cls._BARE_VALUE_OBJECT.sub(
+            r'{"name": \1}', text
+        )
+
+    @staticmethod
+    def _repair_json(text: str) -> str:
+        stack: List[str] = []
+        in_string = False
+        escaped = False
+        i = 0
+        n = len(text)
+
+        while i < n:
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch in "{[":
+                    stack.append(ch)
+                elif ch in "}]":
+                    if stack:
+                        expected = "}" if stack[-1] == "{" else "]"
+                        if ch == expected:
+                            stack.pop()
+                        else:
+                            stack.pop()
+            i += 1
+
+        if in_string:
+            text += '"'
+        for opening in reversed(stack):
+            text += "}" if opening == "{" else "]"
+        return text
+
+    @staticmethod
+    def _strip_code_fences(text: str) -> str:
+        match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return text.strip()
+
+    @staticmethod
+    def _normalize_triplet(item) -> dict:
+        if isinstance(item, list):
+            if len(item) < 3:
+                raise ValueError(f"Array triplet too short: {item}")
+            src, rel, tgt = item[0], item[1], item[2]
+            return {
+                "source": {"name": src},
+                "relation": rel,
+                "target": {"name": tgt},
+            }
+        src = item.get("source_entity") or item.get("source") or {}
+        tgt = item.get("target_entity") or item.get("target") or {}
+        if isinstance(src, str):
+            src = {"name": src}
+        if isinstance(tgt, str):
+            tgt = {"name": tgt}
+        return {
+            "source": src,
+            "relation": item.get("relation"),
+            "target": tgt,
+        }
+
+    def _parse_triplets(self, raw: List[dict]) -> List[Triplet]:
+        triplets: List[Triplet] = []
+        for item in raw:
+            try:
+                source = Entity(
+                    name=item["source"]["name"],
+                    entity_type=self._infer_entity_type(
+                        item["relation"], side="source"
+                    ),
+                )
+                target = Entity(
+                    name=item["target"]["name"],
+                    entity_type=self._infer_entity_type(
+                        item["relation"], side="target"
+                    ),
+                )
+                triplets.append(
+                    Triplet(
+                        source_entity=source,
+                        relation=RelationType(item["relation"]),
+                        target_entity=target,
+                    )
+                )
+            except Exception as exc:
+                logger.debug("Skipping invalid triplet %s: %s", item, exc)
+        return triplets
+
+    @staticmethod
+    def _infer_entity_type(relation: str, side: str) -> EntityType:
+        mapping = {
+            ("operates_in", "source"): EntityType.company,
+            ("operates_in", "target"): EntityType.business_segment,
+            ("reported_metric", "source"): EntityType.company,
+            ("reported_metric", "target"): EntityType.financial_metric,
+            ("impacts_revenue", "source"): EntityType.macro_event,
+            ("impacts_revenue", "target"): EntityType.financial_metric,
+            ("mitigates_risk", "source"): EntityType.business_segment,
+            ("mitigates_risk", "target"): EntityType.risk_factor,
+            ("competes_with", "source"): EntityType.company,
+            ("competes_with", "target"): EntityType.company,
+        }
+        try:
+            return mapping[(relation, side)]
+        except KeyError:
+            return EntityType.company

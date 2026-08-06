@@ -42,7 +42,7 @@ class RetrievalPipeline:
         top_k_sparse: int = 20,
         top_k_graph: int = 20,
         top_k_rrf: int = 50,
-        top_k_final: int = 10,
+        top_k_final: int = 5,
     ) -> None:
         self.llm = llm
         self.top_k_dense = top_k_dense

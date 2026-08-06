@@ -61,7 +61,46 @@ class SEC10KParser:
             raise ValueError(msg)
 
     def convert_to_markdown(self, text: str) -> str:
-        return md(text, heading_style="ATX", strip=["script", "style"])
+        cleaned = self._clean_html_tables(text)
+        return md(cleaned, heading_style="ATX", strip=["script", "style"])
+
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        return text.replace("\xa0", " ")
+
+    @staticmethod
+    def _clean_html_tables(text: str) -> str:
+        if "<table" not in text.lower() and "<a " not in text.lower():
+            return text
+        try:
+            from bs4 import BeautifulSoup
+
+            soup = BeautifulSoup(text, "html.parser")
+            for tag in soup.find_all(["script", "style"]):
+                tag.decompose()
+
+            for a in soup.find_all("a"):
+                for attr in list(a.attrs):
+                    if attr in {"href", "name", "id"}:
+                        del a[attr]
+
+            for table in soup.find_all("table"):
+                rows = []
+                for tr in table.find_all("tr"):
+                    cells = []
+                    for cell in tr.find_all(["td", "th"]):
+                        cell_text = cell.get_text(" ", strip=True)
+                        cell_text = re.sub(r"\s+", " ", cell_text).strip()
+                        if cell_text:
+                            cells.append(cell_text)
+                    if cells:
+                        rows.append(" | ".join(cells))
+                table.replace_with("\n".join(rows) + "\n")
+
+            return soup.get_text("\n")
+        except ImportError:
+            logger.warning("bs4 not available; skipping HTML table cleaning")
+            return text
 
     def extract_sections(
         self,
@@ -69,6 +108,7 @@ class SEC10KParser:
         ticker: str,
         fiscal_year: int,
     ) -> List[dict]:
+        markdown_text = self._normalize_whitespace(markdown_text)
         lines = markdown_text.splitlines()
         sections: List[dict] = []
         current_section: Optional[str] = None
@@ -79,6 +119,9 @@ class SEC10KParser:
             stripped = line.strip()
 
             if not stripped:
+                continue
+
+            if self._is_toc_row(stripped):
                 continue
 
             matched_section = self._match_section_header(stripped)
@@ -145,10 +188,67 @@ class SEC10KParser:
     @staticmethod
     def _read_text(file_path: Path) -> str:
         try:
-            return file_path.read_text(encoding="utf-8", errors="replace")
+            text = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
             logger.error("Failed to read %s: %s", file_path, exc)
             raise
+        return SEC10KParser._extract_main_document(text)
+
+    @staticmethod
+    def _extract_main_document(text: str) -> str:
+        if "<TEXT>" not in text.upper():
+            return text
+
+        for block in re.split(r"<DOCUMENT>", text, flags=re.IGNORECASE):
+            type_match = re.search(
+                r"<TYPE>(.*?)(?:\n|</TYPE>)",
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not type_match:
+                continue
+            doc_type = type_match.group(1).strip().upper()
+            if doc_type != "10-K" and not doc_type.startswith("10-K/"):
+                continue
+            blocks = re.findall(
+                r"<TEXT>(.*?)</TEXT>",
+                block,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if blocks:
+                main = max(blocks, key=len)
+                logger.info(
+                    "Extracted 10-K narrative from SEC full-submission "
+                    "(%d of %d <TEXT> blocks)",
+                    len(main),
+                    len(blocks),
+                )
+                return main
+
+        blocks = re.findall(
+            r"<TEXT>(.*?)</TEXT>",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if not blocks:
+            return text
+        main = max(blocks, key=len)
+        logger.info(
+            "Extracted main document from SEC full-submission "
+            "(%d of %d <TEXT> blocks)",
+            len(main),
+            len(blocks),
+        )
+        return main
+
+    @staticmethod
+    def _is_toc_row(line: str) -> bool:
+        return bool(
+            re.match(
+                r"(?i)^\s*(#+\s*)?item\s+\d+[a-z]?(\.\d+)?\s*\.?\s*\|",
+                line,
+            )
+        )
 
     @staticmethod
     def _match_section_header(line: str) -> Optional[str]:

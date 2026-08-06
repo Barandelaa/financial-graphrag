@@ -11,6 +11,19 @@ from src.retrieval.rrf import FusedResult
 logger = logging.getLogger(__name__)
 
 
+def _detect_device(preferred: str) -> str:
+    if preferred and preferred != "cpu":
+        return preferred
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 @dataclass
 class RerankedResult:
     chunk_id: str
@@ -27,14 +40,18 @@ class CrossEncoderReranker:
     ) -> None:
         self.model_name = model_name
         self._model: Optional[CrossEncoder] = None
-        self._device = device
+        self._device = _detect_device(device)
 
     @property
     def model(self) -> CrossEncoder:
         if self._model is None:
-            self._model = CrossEncoder(
-                self.model_name, device=self._device
-            )
+            from src.env import get_hf_token
+
+            kwargs = {"device": self._device}
+            token = get_hf_token()
+            if token:
+                kwargs["token"] = token
+            self._model = CrossEncoder(self.model_name, **kwargs)
         return self._model
 
     def rerank(
