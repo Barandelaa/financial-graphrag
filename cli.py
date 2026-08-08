@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 HELP_TEXT = """
 Comandos disponibles:
   <pregunta>                  -> Consulta al pipeline RAG
-  /ingest <ticker> <año>      -> Ingiere y indexa un 10-K (ej: /ingest AAPL 2023)
+  /ingest <ticker> <año>      -> Ingiere e indexa un 10-K (ej: /ingest AAPL 2023)
   /ingest-all                 -> Ingiere todas las empresas de data/companies.json
   /clear                      -> Limpia la pantalla
   /help                       -> Muestra esta ayuda
@@ -87,7 +87,7 @@ def run_repl(pipeline: FinancialGraphRAGPipeline) -> None:
         print("-" * 60)
         print(
             f"[Dense: {result.dense_results} | Sparse: {result.sparse_results} | "
-            f"Graph: {result.graph_results}]"
+            f"Graph: {result.graph_results} | Facts: {len(result.graph_facts)}]"
         )
         if result.citations:
             print("\nCitas:")

@@ -106,8 +106,8 @@ class GraphTraversalRetriever:
     def extract_entities(self, query: str) -> List[str]:
         candidates: set[str] = set()
 
-        # Tickers en mayúsculas (AAPL, MSFT...) y palabras en CamelCase
-        tickers = re.findall(r"\b[A-Z]{2,5}\b", query)
+        # Tickers en mayúsculas (AAPL, MSFT, NVIDIA...) y palabras en CamelCase
+        tickers = re.findall(r"\b[A-Z]{2,8}\b", query)
         candidates.update(tickers)
 
         # Palabras Capitalizadas (Apple, Boeing, RiskFactor...) y mapear a ticker
@@ -142,6 +142,13 @@ class GraphTraversalRetriever:
 
         logger.debug("Extracted entity candidates from query: %s", candidates)
         return sorted(candidates)
+
+    def match_query_entities(self, query: str) -> List[tuple[str, str]]:
+        entity_candidates = self.extract_entities(query)
+        if not entity_candidates:
+            return []
+        conn = self.schema.connection
+        return self._match_entities(conn, entity_candidates)
 
     def search(
         self,

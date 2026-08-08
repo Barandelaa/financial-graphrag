@@ -132,6 +132,21 @@ class DenseRetriever:
             logger.warning("Could not read existing chunk ids: %s", exc)
             return set()
 
+    def load_all_chunks(self) -> List[dict]:
+        try:
+            table = self._db.open_table(self.table_name)
+        except Exception as exc:
+            logger.warning("Cannot open table '%s': %s", self.table_name, exc)
+            return []
+        try:
+            df = table.to_pandas()
+        except Exception as exc:
+            logger.warning("Could not read LanceDB table: %s", exc)
+            return []
+        if not len(df):
+            return []
+        return df.to_dict("records")
+
     def search(
         self,
         query: str,
