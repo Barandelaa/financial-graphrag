@@ -8,7 +8,7 @@ from langchain_core.language_models import BaseChatModel
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OLLAMA_MODEL = "qwen2.5:7b"
+DEFAULT_OLLAMA_MODEL = "qwen3:8b"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_GROQ_MODEL = "mixtral-8x7b-32768"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
@@ -80,5 +80,5 @@ def create_embeddings(
             kwargs["token"] = token
         return HuggingFaceEmbeddings(model_name=model_name, **kwargs)
     except Exception as exc:
-        logger.warning("Could not create local embeddings (%s); RAGAS metrics needing embeddings will be skipped", exc)
+        logger.warning("Could not create local embeddings (%s)", exc)
         return None

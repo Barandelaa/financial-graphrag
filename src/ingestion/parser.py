@@ -121,9 +121,6 @@ class SEC10KParser:
             if not stripped:
                 continue
 
-            if self._is_toc_row(stripped):
-                continue
-
             matched_section = self._match_section_header(stripped)
             if matched_section:
                 if current_section and current_content:
@@ -138,6 +135,8 @@ class SEC10KParser:
                     )
                 current_section = matched_section
                 current_content = []
+            elif self._is_toc_row(stripped):
+                continue
             else:
                 current_content.append(line)
 
@@ -252,14 +251,23 @@ class SEC10KParser:
 
     @staticmethod
     def _match_section_header(line: str) -> Optional[str]:
+        clean = line.strip()
         for item in SEC_KNOWN_ITEMS:
-            pattern = re.compile(
-                rf"^\s*#+\s*{re.escape(item)}\b", re.IGNORECASE
+            escaped = re.escape(item)
+            pattern_md = re.compile(
+                rf"^\s*#+\s*{escaped}\b", re.IGNORECASE
             )
-            if pattern.match(line):
+            if pattern_md.match(clean):
                 return item
-            alt = re.compile(rf"^\s*{re.escape(item)}\b", re.IGNORECASE)
-            if alt.match(line):
+            pattern_plain = re.compile(
+                rf"^\s*{escaped}\b", re.IGNORECASE
+            )
+            if pattern_plain.match(clean):
+                return item
+            pattern_table = re.compile(
+                rf"^\s*{escaped}\.?\s*\|", re.IGNORECASE
+            )
+            if pattern_table.match(clean):
                 return item
         return None
 

@@ -57,7 +57,7 @@ REL_TABLE_DDL: List[str] = [
     "  FROM Company TO FinancialMetric"
     ")",
     "CREATE REL TABLE IF NOT EXISTS IMPACTS_REVENUE ("
-    "  FROM RiskFactor TO FinancialMetric"
+    "  FROM MacroEvent TO FinancialMetric"
     ")",
     "CREATE REL TABLE IF NOT EXISTS MITIGATES_RISK ("
     "  FROM BusinessSegment TO RiskFactor"

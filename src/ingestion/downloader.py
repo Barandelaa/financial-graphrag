@@ -83,6 +83,9 @@ class SEC10KDownloader:
         )
         if ticker_dir.exists():
             for filing_dir in sorted(ticker_dir.iterdir()):
+                accession = filing_dir.name
+                if not self._accession_matches_year(accession, year):
+                    continue
                 for f in filing_dir.rglob("*"):
                     if f.suffix.lower() in {".pdf", ".html", ".htm", ".txt"}:
                         downloaded.append(f)
@@ -98,6 +101,18 @@ class SEC10KDownloader:
     @staticmethod
     def _cache_key(ticker: str, year: int, after_date: Optional[str], before_date: Optional[str]) -> str:
         return f"{ticker}|{year}|{after_date or ''}|{before_date or ''}"
+
+    @staticmethod
+    def _accession_matches_year(accession: str, year: int) -> bool:
+        parts = accession.split("-")
+        if len(parts) >= 2:
+            try:
+                accession_year = int(parts[1][:2])
+                full_year = 2000 + accession_year if accession_year < 100 else accession_year
+                return full_year == year
+            except (ValueError, IndexError):
+                pass
+        return True
 
     def _load_cache(self) -> dict:
         if not self.cache_manifest_path.exists():

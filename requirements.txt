@@ -8,10 +8,12 @@ sec-edgar-downloader>=5.0
 pdfplumber>=0.10.0
 markdownify>=0.11.0
 unstructured[pdf,html]>=0.12.0
+beautifulsoup4>=4.12.0
 
 # === Embeddings & Sentence Transformers ===
 sentence-transformers>=2.2.0
 torch>=2.0.0
+numpy>=1.24.0
 
 # === Vector Store (LanceDB embedded) ===
 lancedb>=0.8.0
@@ -23,29 +25,17 @@ rank-bm25>=0.2.2
 kuzu>=0.6.0
 
 # === LLM / Inference (Groq + LangChain) ===
-groq>=0.5.0
 ollama>=0.3.0
-langchain>=0.1.0
+langchain-core>=0.1.0
 langchain-groq>=0.1.0
 langchain-ollama>=0.2.0
 langchain-huggingface>=0.1.0
 langchain-community>=0.1.0
 
-# === LangGraph (orchestration) ===
-langgraph>=0.1.0
-
-# === Cross-Encoder Reranker ===
-sentence-transformers>=2.2.0  # BGE-Reranker via cross-encoder
-
-# === Evaluation (RAGAS) ===
-ragas>=0.1.0
-datasets>=2.15.0
-
 # === Graph community detection (Leiden) ===
+networkx>=3.0
 leidenalg>=0.10.0
 python-igraph>=0.11.0
 
 # === Utilities ===
 python-dotenv>=1.0.0
-tqdm>=4.66.0
-orjson>=3.9.0

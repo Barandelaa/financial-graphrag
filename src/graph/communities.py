@@ -134,7 +134,7 @@ class CommunityDetector:
         queries = {
             "OPERATES_IN": ("Company", "ticker", "BusinessSegment", "id"),
             "REPORTED_METRIC": ("Company", "ticker", "FinancialMetric", "id"),
-            "IMPACTS_REVENUE": ("RiskFactor", "id", "FinancialMetric", "id"),
+            "IMPACTS_REVENUE": ("MacroEvent", "id", "FinancialMetric", "id"),
             "MITIGATES_RISK": ("BusinessSegment", "id", "RiskFactor", "id"),
             "COMPETES_WITH": ("Company", "ticker", "Company", "ticker"),
         }

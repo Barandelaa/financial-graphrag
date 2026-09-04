@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -44,6 +45,155 @@ _MENTIONS_TABLE_MAP: dict[EntityType, str] = {
     EntityType.business_segment: "MENTIONS_SEGMENT",
     EntityType.macro_event: "MENTIONS_EVENT",
 }
+
+# Alias de compañía (minúsculas) -> ticker canónico. Mantiene la tabla
+# Company limpia: 'Apple'/'Microsoft'/typos OCR ('AM,ZN','MS,FT','NV. DA')
+# colapsan al ticker en vez de crear nodos fantasma.
+_COMPANY_ALIAS_TO_TICKER: dict[str, str] = {
+    "apple": "AAPL",
+    "apple inc": "AAPL",
+    "apple inc.": "AAPL",
+    "microsoft": "MSFT",
+    "microsoft corporation": "MSFT",
+    "amazon": "AMZN",
+    "amazon.com": "AMZN",
+    "amazon inc": "AMZN",
+    "google": "GOOGL",
+    "alphabet": "GOOGL",
+    "alphabet inc": "GOOGL",
+    "meta": "META",
+    "meta platforms": "META",
+    "facebook": "META",
+    "tesla": "TSLA",
+    "tesla inc": "TSLA",
+    "nvidia": "NVDA",
+    "nvidia corporation": "NVDA",
+    "berkshire hathaway": "BRK.B",
+    "berkshire": "BRK.B",
+}
+
+_VALID_TICKERS = frozenset(
+    {"AAPL", "MSFT", "AMZN", "GOOGL", "NVDA", "META", "TSLA", "BRK.B"}
+)
+
+# Nombres genéricos que el extractor cuela como Company y deben descartarse.
+_NOISY_COMPANY_EXACT = frozenset(
+    {
+        "services",
+        "products",
+        "research and development",
+        "selling, general and administrative",
+        "businesssegment",
+        "riskfactor",
+        "financialmetric",
+        "company",
+        "macroevent",
+        "other companies",
+        "others",
+        "unspecified competitors",
+        "unspecified companies",
+        "unspecified",
+        "our competitors",
+        "our peers",
+        "competitors",
+        "competitors in technology sector",
+        "competitors developing ai technologies",
+        "company x",
+        "none",
+        "n/a",
+        "various competitors",
+        "other bet companies",
+        "other housing companies",
+        "major automotive companies",
+        "mature and prosperous companies",
+        "start-ups and emerging companies",
+        # Segmentos colados como Company por el extractor
+        "data center",
+        "graphics",
+        "compute & networking",
+        "building products group",
+        "consumer products group",
+        "industrial products group",
+        "industrial products",
+        "railroad",
+    }
+)
+
+_NOISY_COMPANY_PREFIXES = (
+    "companies that",
+    "companies with",
+    "other companies",
+    "other freight",
+    "other participants",
+    "third-party ",
+    "unspecified ",
+    "unknown ",
+    "platform-based ecosystem competitors",
+    "manufacturers and suppliers",
+    "national manufacturers",
+    "smaller regional manufacturers",
+    "large global manufacturers",
+)
+
+
+def _normalize_company_name(raw: str) -> Optional[str]:
+    """Devuelve el ticker canónico o el nombre subsidiario, o None si vacío."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    alias = _COMPANY_ALIAS_TO_TICKER.get(s.lower())
+    if alias:
+        return alias
+    upper = s.upper()
+    if upper in _VALID_TICKERS:
+        return upper
+    # Variantes con sufijos legales: 'Amazon, Inc.' -> 'AMZN', 'Microsoft
+    # Corporation, or Microsoft' -> 'MSFT'. Substring insensible a puntuación.
+    cleaned = re.sub(r"[^a-z]", "", s.lower())
+    for key, ticker in _COMPANY_ALIAS_TO_TICKER.items():
+        if re.sub(r"[^a-z]", "", key) and re.sub(r"[^a-z]", "", key) in cleaned:
+            return ticker
+    # Typos OCR: 'AM,ZN' -> 'AMZN', 'MS,FT' -> 'MSFT', 'NV. DA' -> 'NVDA',
+    # 'BR. B'/'BRK, B'/'BRK3.B'/'BR.0' -> 'BRK.B'.
+    letters = re.sub(r"[^A-Z]", "", upper)
+    if letters in {"AAPL", "MSFT", "AMZN", "GOOGL", "NVDA", "META", "TSLA"}:
+        return letters
+    if letters in {"BRKB", "BRB", "BRO", "BR", "BRK"}:
+        return "BRK.B"
+    return s
+
+
+def _is_noisy_company(name: str) -> bool:
+    lowered = name.strip().lower()
+    if not lowered:
+        return True
+    if lowered in _NOISY_COMPANY_EXACT:
+        return True
+    if lowered.startswith(_NOISY_COMPANY_PREFIXES):
+        return True
+    if len(name.strip()) > 60:
+        return True
+    return False
+
+
+def _entity_pk_value(entity: Entity) -> Optional[str]:
+    """PK normalizada para un Entity, o None si debe descartarse."""
+    raw = (entity.name or "").strip()
+    if not raw:
+        return None
+    if entity.entity_type == EntityType.company:
+        norm = _normalize_company_name(raw)
+        if norm is None or _is_noisy_company(norm):
+            return None
+        return norm
+    # Tickers/alias colados en otras tablas (p.ej. MacroEvent 'AAPL' o
+    # BusinessSegment 'Apple') se descartan: pertenecen a Company.
+    if _normalize_company_name(raw) in _VALID_TICKERS:
+        return None
+    # Resto de tipos: recorta y descarta vacíos o absurdamente largos.
+    if len(raw) > 300:
+        return None
+    return raw
 
 
 class GraphPipeline:
@@ -217,7 +367,24 @@ class GraphPipeline:
         chunk: Chunk,
         triplets: List[FinancialTriplet],
     ) -> None:
+        seen: set[tuple[str, str, str, str, str]] = set()
         for ft in triplets:
+            src_val = _entity_pk_value(ft.triplet.source_entity)
+            dst_val = _entity_pk_value(ft.triplet.target_entity)
+            if src_val is None or dst_val is None:
+                continue
+            if src_val.lower() == dst_val.lower():
+                continue
+            key = (
+                ft.triplet.source_entity.entity_type.value,
+                src_val.lower(),
+                ft.triplet.relation.value,
+                ft.triplet.target_entity.entity_type.value,
+                dst_val.lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
             self._upsert_entity(conn, ft.triplet.source_entity)
             self._upsert_entity(conn, ft.triplet.target_entity)
             self._upsert_relationship(conn, ft)
@@ -233,9 +400,14 @@ class GraphPipeline:
             logger.warning("Unknown entity type: %s", entity.entity_type)
             return
 
+        pk_val = _entity_pk_value(entity)
+        if pk_val is None:
+            logger.debug("Skipping noisy/empty entity: %r", entity.name)
+            return
+
         pk_field = self._pk_field(table)
         props = dict(entity.properties or {})
-        props["name"] = entity.name
+        props["name"] = pk_val
 
         set_parts = [f"e.{k} = ${k}" for k in props]
         set_clause = "SET " + ", ".join(set_parts) if set_parts else ""
@@ -243,7 +415,7 @@ class GraphPipeline:
         query = (
             f"MERGE (e:{table} {{{pk_field}: $pk_val}}) {set_clause}"
         )
-        params = {"pk_val": entity.name, **props}
+        params = {"pk_val": pk_val, **props}
         try:
             conn.execute(query, params)
         except RuntimeError as exc:
@@ -266,6 +438,11 @@ class GraphPipeline:
         src_pk = self._pk_field(src_table)
         dst_pk = self._pk_field(dst_table)
 
+        src_val = _entity_pk_value(ft.triplet.source_entity)
+        dst_val = _entity_pk_value(ft.triplet.target_entity)
+        if src_val is None or dst_val is None:
+            return
+
         query = (
             f"MATCH (s:{src_table}), (t:{dst_table}) "
             f"WHERE s.{src_pk} = $src AND t.{dst_pk} = $dst "
@@ -274,7 +451,7 @@ class GraphPipeline:
         try:
             conn.execute(
                 query,
-                {"src": ft.source_name, "dst": ft.target_name},
+                {"src": src_val, "dst": dst_val},
             )
         except RuntimeError as exc:
             logger.debug("Rel upsert skipped: %s", exc)
@@ -285,16 +462,31 @@ class GraphPipeline:
         chunk_id: str,
         ft: FinancialTriplet,
     ) -> None:
-        rel_table = _MENTIONS_TABLE_MAP.get(
-            ft.triplet.target_entity.entity_type
-        )
+        # Indexa tanto source como target para que las preguntas por
+        # compañía/evento encuentren sus chunks (antes solo el target,
+        # lo que dejaba MENTIONS_COMPANY casi vacío y MENTIONS_EVENT en 0).
+        for entity in (
+            ft.triplet.source_entity,
+            ft.triplet.target_entity,
+        ):
+            self._upsert_single_mention(conn, chunk_id, entity)
+
+    def _upsert_single_mention(
+        self,
+        conn: kuzu.Connection,
+        chunk_id: str,
+        entity: Entity,
+    ) -> None:
+        rel_table = _MENTIONS_TABLE_MAP.get(entity.entity_type)
         if rel_table is None:
             return
 
-        dst_table = _NODE_TABLE_MAP.get(
-            ft.triplet.target_entity.entity_type
-        )
+        dst_table = _NODE_TABLE_MAP.get(entity.entity_type)
         if dst_table is None:
+            return
+
+        entity_name = _entity_pk_value(entity)
+        if entity_name is None:
             return
 
         dst_pk = self._pk_field(dst_table)
@@ -307,7 +499,7 @@ class GraphPipeline:
         try:
             conn.execute(
                 query,
-                {"chunk_id": chunk_id, "entity_name": ft.target_name},
+                {"chunk_id": chunk_id, "entity_name": entity_name},
             )
         except RuntimeError as exc:
             logger.debug("Mentions rel skipped: %s", exc)
