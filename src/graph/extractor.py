@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
+import time
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
@@ -16,7 +18,7 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are an expert financial analyst extracting structured knowledge "
+            "/no_think You are an expert financial analyst extracting structured knowledge "
             "from SEC 10-K reports. Extract all financial entities and their "
             "relationships from the text below. Use ONLY the ontology provided.\n\n"
             "ENTITY TYPES:\n"
@@ -35,6 +37,7 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
             '{{"triplets": [{{"source": {{"name": "..."}}, "relation": "...", '
             '"target": {{"name": "..."}}}}]}}\n\n'
             "Rules:\n"
+            "- Do NOT use <think> tags. Do NOT explain.\n"
             "- Use the exact relation names above.\n"
             "- The source must be the company ticker where the relation is "
             "Company -> X (e.g. operates_in, reported_metric).\n"
@@ -43,10 +46,42 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
         ),
         (
             "human",
-            "TEXT: {chunk_text}\n\n"
+            "/no_think TEXT: {chunk_text}\n\n"
             "COMPANY TICKER: {ticker}\n"
             "FISCAL YEAR: {year}\n"
             "SECTION: {section_id}",
+        ),
+    ]
+)
+
+# Batch prompt: N chunks in one LLM call to amortize latency (3-8x speedup)
+BATCH_EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "/no_think You are an expert financial analyst extracting structured knowledge "
+            "from SEC 10-K reports. Use ONLY the ontology below.\n\n"
+            "ENTITY TYPES: Company (ticker), FinancialMetric, RiskFactor, "
+            "BusinessSegment, MacroEvent\n"
+            "RELATIONSHIP TYPES: operates_in (Company->BusinessSegment), "
+            "reported_metric (Company->FinancialMetric), "
+            "impacts_revenue (RiskFactor/MacroEvent->FinancialMetric), "
+            "mitigates_risk (BusinessSegment->RiskFactor), "
+            "competes_with (Company->Company)\n\n"
+            "You will receive N chunks, each prefixed with CHUNK_ID and SECTION.\n"
+            "Do NOT use <think> tags. Do NOT add explanations. Return ONLY a JSON object with this exact shape, no extra text:\n"
+            '{{\"results\": [{{\"chunk_id\": \"...\", \"triplets\": [{{\"source\": {{\"name\": \"...\"}}, \"relation\": \"...\", \"target\": {{\"name\": \"...\"}}}}]}}]}}\n\n'
+            "Rules:\n"
+            "- One entry per input chunk_id, even if no triplets (use empty list).\n"
+            "- For Company->X relations, source must be the company ticker.\n"
+            "- Only include entities explicitly mentioned in that chunk.\n"
+            "- Use exact relation names listed above.",
+        ),
+        (
+            "human",
+            "/no_think COMPANY TICKER: {ticker}\n"
+            "FISCAL YEAR: {year}\n\n"
+            "CHUNKS:\n{chunks_block}",
         ),
     ]
 )
@@ -117,15 +152,39 @@ class FinancialTriplet:
         return self.triplet.relation.value
 
 
+# Heurística ligera para evitar llamar al LLM en chunks vacíos/boilerplate
+_SKIPPABLE_SECTION_PATTERNS = re.compile(
+    r"(table of contents|exhibit\s+\d+|power of attorney|signatures?)", re.IGNORECASE
+)
+
+
+def _is_skippable_chunk(text: str, section_id: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t.split()) < 20:
+        return True
+    # Secciones que casi nunca aportan tripletas con la ontología actual
+    if _SKIPPABLE_SECTION_PATTERNS.search(section_id or ""):
+        # pero no descartar si el texto menciona métricas/segmentos explícitos
+        lower = t.lower()
+        if not any(k in lower for k in ("revenue", "segment", "risk", "competitor", "subsidiary", "market")):
+            return True
+    return False
+
+
 class TripletExtractor:
     def __init__(
         self,
         llm: BaseChatModel,
         max_retries: int = 2,
+        base_delay: float = 0.6,
+        max_delay: float = 4.0,
     ) -> None:
         self.llm = llm
         self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
 
+    # ------------------------------------------------------------------ single
     def extract_from_chunk(
         self,
         chunk_text: str,
@@ -134,17 +193,19 @@ class TripletExtractor:
         section_id: str,
         chunk_id: str,
     ) -> List[FinancialTriplet]:
+        if _is_skippable_chunk(chunk_text, section_id):
+            logger.debug("Skipping boilerplate chunk %s (section=%s)", chunk_id, section_id)
+            return []
         payload = {
             "chunk_text": chunk_text[:4000],
             "ticker": ticker,
             "year": str(year),
             "section_id": section_id,
         }
-
         last_error: Optional[Exception] = None
-        for attempt in range(1 + self.max_retries):
+        for attempt in range(1 + self.max_retries + 1):
             try:
-                raw = self._invoke_json(payload)
+                raw = self._invoke_single_json(payload)
                 parsed = self._parse_triplets(raw)
                 return [
                     FinancialTriplet(
@@ -158,12 +219,25 @@ class TripletExtractor:
                 ]
             except Exception as exc:
                 last_error = exc
-                logger.warning(
-                    "Extraction attempt %d failed for chunk %s: %s",
-                    attempt + 1,
-                    chunk_id,
-                    exc,
-                )
+                if attempt <= self.max_retries:
+                    delay = min(self.base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.5), self.max_delay)
+                    logger.warning(
+                        "Extraction attempt %d/%d failed for chunk %s: %s — retry in %.1fs",
+                        attempt,
+                        self.max_retries + 1,
+                        chunk_id,
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.warning(
+                        "Extraction attempt %d/%d failed for chunk %s: %s",
+                        attempt,
+                        self.max_retries + 1,
+                        chunk_id,
+                        exc,
+                    )
 
         logger.error(
             "All extraction attempts failed for chunk %s: %s",
@@ -172,34 +246,246 @@ class TripletExtractor:
         )
         return []
 
-    def _invoke_json(self, payload: dict) -> List[dict]:
-        messages = EXTRACTION_PROMPT.format_messages(**payload)
-        try:
-            response = self.llm.invoke(messages)
-        except Exception:
-            structured = self.llm.with_structured_output(
-                ExtractionResult, method="json_mode"
-            )
-            response = structured.invoke(messages)
+    # ------------------------------------------------------------------ batch
+    def extract_from_batch(
+        self,
+        batch: List[dict],
+        ticker: str,
+        year: int,
+    ) -> Dict[str, List[FinancialTriplet]]:
+        """
+        Extrae tripletas para un lote de chunks en una sola llamada LLM.
+        batch: list of {chunk_id, text, section_id}
+        Retorna dict chunk_id -> List[FinancialTriplet]. En fallo total, cae
+        a extracción single-chunk por elemento.
+        """
+        # Separa skippables sin LLM
+        skippable_ids: set[str] = set()
+        active: List[dict] = []
+        for item in batch:
+            if _is_skippable_chunk(item.get("text", ""), item.get("section_id", "")):
+                skippable_ids.add(item["chunk_id"])
+            else:
+                active.append(item)
 
+        result: Dict[str, List[FinancialTriplet]] = {cid: [] for cid in skippable_ids}
+
+        if not active:
+            return result
+
+        # Fast-path: batch_size 1 → evita el prompt batch inestable de qwen3; usa single paralelo
+        if len(active) == 1:
+            item = active[0]
+            cid = item["chunk_id"]
+            triplets = self.extract_from_chunk(
+                chunk_text=item.get("text", ""),
+                ticker=ticker,
+                year=year,
+                section_id=item.get("section_id", ""),
+                chunk_id=cid,
+            )
+            result[cid] = triplets
+            return result
+
+        # Formatea bloque para el prompt batch
+        chunks_block_parts: List[str] = []
+        id_to_meta: Dict[str, dict] = {}
+        for item in active:
+            cid = item["chunk_id"]
+            sec = item.get("section_id", "")
+            # 1800 chars ≈ 450 tokens; 4 chunks → ~1800 tokens + prompt < 8192 ctx
+            txt = (item.get("text", "") or "")[:1900]
+            chunks_block_parts.append(f"--- CHUNK_ID: {cid} | SECTION: {sec} ---\n{txt}")
+            id_to_meta[cid] = item
+
+        chunks_block = "\n\n".join(chunks_block_parts)
+        payload = {"ticker": ticker, "year": str(year), "chunks_block": chunks_block}
+
+        last_error: Optional[Exception] = None
+        # Batch es inestable en qwen3; solo 1 reintento, luego fallback inmediato a per-chunk
+        batch_retries = min(self.max_retries, 1)
+        for attempt in range(1 + batch_retries + 1):
+            try:
+                raw_by_id = self._invoke_batch_json(payload)
+                # raw_by_id: dict chunk_id -> List[dict triplets raw]
+                for cid, raw_triplets in raw_by_id.items():
+                    meta = id_to_meta.get(cid)
+                    if meta is None:
+                        logger.debug("Batch returned unknown chunk_id %s — ignoring", cid)
+                        continue
+                    parsed = self._parse_triplets(raw_triplets)
+                    result[cid] = [
+                        FinancialTriplet(
+                            triplet=t,
+                            chunk_id=cid,
+                            company_ticker=ticker,
+                            fiscal_year=year,
+                            section_id=meta.get("section_id", ""),
+                        )
+                        for t in parsed
+                    ]
+                # Asegura que todo chunk activo tenga entrada
+                for cid in id_to_meta:
+                    result.setdefault(cid, [])
+                return result
+            except Exception as exc:
+                last_error = exc
+                if attempt <= batch_retries:
+                    delay = min(self.base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.3), self.max_delay)
+                    logger.debug(
+                        "Batch extraction attempt %d/%d failed (%d chunks): %s — retry in %.1fs",
+                        attempt,
+                        batch_retries + 1,
+                        len(active),
+                        exc,
+                        delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.debug(
+                        "Batch extraction attempt %d/%d failed (%d chunks): %s",
+                        attempt,
+                        batch_retries + 1,
+                        len(active),
+                        exc,
+                    )
+
+        # Fallback: intenta uno a uno para no perder todo el lote
+        logger.info("Batch fallback to per-chunk for %d chunks (%s)", len(active), last_error)
+        for item in active:
+            cid = item["chunk_id"]
+            # evita sobrescribir si ya se obtuvo algo en intentos parciales
+            if cid in result and result[cid]:
+                continue
+            triplets = self.extract_from_chunk(
+                chunk_text=item.get("text", ""),
+                ticker=ticker,
+                year=year,
+                section_id=item.get("section_id", ""),
+                chunk_id=cid,
+            )
+            result[cid] = triplets
+        return result
+
+    # ---------------------------------------------------------------- internal
+    def _invoke_single_json(self, payload: dict) -> List[dict]:
+        messages = EXTRACTION_PROMPT.format_messages(**payload)
+        # Solo invoke directo + parsing manual (structured falla con qwen3: espera source_entity vs source)
+        response = self.llm.invoke(messages)
         content = getattr(response, "content", None)
         if content is None:
-            raise ValueError("LLM returned no content")
-
-        json_text = self._strip_code_fences(str(content))
-        data = self._loads_json(json_text)
+            if isinstance(response, dict):
+                content = json.dumps(response)
+            else:
+                raise ValueError("LLM returned no content")
+        raw = str(content)
+        json_text = self._strip_code_fences(raw)
+        if not json_text or json_text.strip() in ("", "null"):
+            raise ValueError(f"LLM empty (single). Raw preview: {raw[:300]!r}")
+        data = self._extract_json_object(json_text)
         if isinstance(data, dict):
             triplets = data.get("triplets", [])
         elif isinstance(data, list):
             triplets = data
         else:
             raise ValueError(f"Unexpected JSON shape: {type(data)}")
+        return [self._normalize_triplet(item) for item in triplets if isinstance(item, (dict, list))]
 
-        return [
-            self._normalize_triplet(item)
-            for item in triplets
-            if isinstance(item, (dict, list))
-        ]
+    def _invoke_batch_json(self, payload: dict) -> Dict[str, List[dict]]:
+        messages = BATCH_EXTRACTION_PROMPT.format_messages(**payload)
+        response = self.llm.invoke(messages)
+        content = getattr(response, "content", None)
+        if content is None:
+            if isinstance(response, dict):
+                content = json.dumps(response)
+            else:
+                raise ValueError("LLM returned no content (batch)")
+        raw_content = str(content)
+        json_text = self._strip_code_fences(raw_content)
+        if not json_text or json_text.strip() in ("", "null", "{}"):
+            raise ValueError(f"LLM returned empty JSON (batch). Raw preview: {raw_content[:400]!r}")
+        data = self._extract_json_object(json_text)
+        return self._parse_batch_data(data)
+
+    def _parse_batch_data(self, data) -> Dict[str, List[dict]]:
+        """Normaliza respuesta batch a dict chunk_id -> raw triplets."""
+        if isinstance(data, dict):
+            # Formato esperado: {"results": [{"chunk_id": "...", "triplets": [...]}, ...]}
+            if "results" in data and isinstance(data["results"], list):
+                out: Dict[str, List[dict]] = {}
+                for entry in data["results"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    cid = entry.get("chunk_id") or entry.get("id") or entry.get("chunkId")
+                    if not cid:
+                        continue
+                    triplets = entry.get("triplets", entry.get("triples", []))
+                    if not isinstance(triplets, list):
+                        triplets = []
+                    out[str(cid)] = [self._normalize_triplet(t) for t in triplets if isinstance(t, (dict, list))]
+                return out
+            # Fallback: diccionario chunk_id -> triplets
+            # o {"triplets": [...]} sin chunk_id (caso degenerado)
+            if "triplets" in data and isinstance(data["triplets"], list) and "results" not in data:
+                # No hay forma de asignar sin chunk_id: retorna vacío y el caller hará fallback
+                raise ValueError("Batch response missing chunk_id mapping (got single triplets list)")
+            # Intenta tratar cada clave como chunk_id
+            out2: Dict[str, List[dict]] = {}
+            for k, v in data.items():
+                if isinstance(v, list):
+                    out2[str(k)] = [self._normalize_triplet(t) for t in v if isinstance(t, (dict, list))]
+                elif isinstance(v, dict) and "triplets" in v:
+                    out2[str(k)] = [self._normalize_triplet(t) for t in v["triplets"] if isinstance(t, (dict, list))]
+            if out2:
+                return out2
+        elif isinstance(data, list):
+            # Lista de {"chunk_id":..., "triplets":...}
+            out3: Dict[str, List[dict]] = {}
+            for entry in data:
+                if isinstance(entry, dict) and "chunk_id" in entry:
+                    cid = entry["chunk_id"]
+                    triplets = entry.get("triplets", [])
+                    out3[str(cid)] = [self._normalize_triplet(t) for t in triplets if isinstance(t, (dict, list))]
+            if out3:
+                return out3
+        raise ValueError(f"Unrecognized batch JSON shape: {str(data)[:400]}")
+
+    @staticmethod
+    def _triplet_to_raw_dict(triplet: Triplet) -> dict:
+        return {
+            "source": {"name": triplet.source_entity.name},
+            "relation": triplet.relation.value,
+            "target": {"name": triplet.target_entity.name},
+        }
+
+    def _extract_json_object(self, text: str):
+        """Extrae el primer objeto JSON válido del texto. Tolera prefijos/sufijos."""
+        text = text.strip()
+        # Intento directo
+        try:
+            return self._loads_json(text)
+        except Exception:
+            pass
+        # Busca el JSON más externo entre primera { y última }
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start : end + 1]
+            try:
+                return self._loads_json(candidate)
+            except Exception:
+                pass
+            # Intenta extraer array si el modelo devolvió lista
+            start_a = text.find("[")
+            end_a = text.rfind("]")
+            if start_a != -1 and end_a != -1:
+                candidate_a = text[start_a : end_a + 1]
+                try:
+                    return self._loads_json(candidate_a)
+                except Exception:
+                    pass
+        # último intento: loads con reparaciones
+        return self._loads_json(text)
 
     @staticmethod
     def _loads_json(json_text: str):
@@ -220,9 +506,7 @@ class TripletExtractor:
 
     @classmethod
     def _repair_bare_value_objects(cls, text: str) -> str:
-        return cls._BARE_VALUE_OBJECT.sub(
-            r'{"name": \1}', text
-        )
+        return cls._BARE_VALUE_OBJECT.sub(r'{"name": \1}', text)
 
     @staticmethod
     def _repair_json(text: str) -> str:
@@ -262,7 +546,18 @@ class TripletExtractor:
         return text
 
     @staticmethod
+    def _strip_thinking(text: str) -> str:
+        # qwen3:8b en modo thinking emite <think>...</think> antes del JSON
+        # format=json de Ollama no siempre lo elimina
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        # por si queda etiqueta sin cerrar
+        text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+        return text.strip()
+
+    @staticmethod
     def _strip_code_fences(text: str) -> str:
+        # primero elimina thinking, luego code fences
+        text = TripletExtractor._strip_thinking(text)
         match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
         if match:
             return match.group(1).strip()
@@ -297,15 +592,11 @@ class TripletExtractor:
             try:
                 source = Entity(
                     name=item["source"]["name"],
-                    entity_type=self._infer_entity_type(
-                        item["relation"], side="source"
-                    ),
+                    entity_type=self._infer_entity_type(item["relation"], side="source"),
                 )
                 target = Entity(
                     name=item["target"]["name"],
-                    entity_type=self._infer_entity_type(
-                        item["relation"], side="target"
-                    ),
+                    entity_type=self._infer_entity_type(item["relation"], side="target"),
                 )
                 triplets.append(
                     Triplet(

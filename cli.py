@@ -22,9 +22,16 @@ Comandos disponibles:
 """.strip()
 
 
-def build_pipeline() -> FinancialGraphRAGPipeline:
+def build_pipeline(
+    max_workers: int = 4,
+    batch_size: int = 1,
+) -> FinancialGraphRAGPipeline:
     llm = create_llm()
-    return FinancialGraphRAGPipeline(llm=llm)
+    return FinancialGraphRAGPipeline(
+        llm=llm,
+        graph_max_workers=max_workers,
+        graph_batch_size=batch_size,
+    )
 
 
 def run_repl(pipeline: FinancialGraphRAGPipeline) -> None:
@@ -123,11 +130,23 @@ def main(argv: Optional[List[str]] = None) -> None:
         default=None,
         help="Año fiscal a ingerir al arrancar (requiere --ticker)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Workers paralelos para extracción de tripletas (default 4, óptimo para 12GB VRAM)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Chunks por llamada LLM en batch (default 1=paralelo fiable con qwen3:8b; 2-3 experimental)",
+    )
     args = parser.parse_args(argv)
 
     load_env()
 
-    pipeline = build_pipeline()
+    pipeline = build_pipeline(max_workers=args.workers, batch_size=args.batch_size)
 
     try:
         if args.ticker or args.year:

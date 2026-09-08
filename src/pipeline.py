@@ -42,6 +42,9 @@ class FinancialGraphRAGPipeline:
         vector_db_uri: str | Path = "data/vector_store/lancedb",
         chunk_size: int = 600,
         chunk_overlap: int = 90,
+        graph_max_workers: int = 4,
+        graph_batch_size: int = 1,
+        graph_save_every: int = 1,
     ) -> None:
         self.llm = llm
         self.ingestion = IngestionPipeline(
@@ -51,7 +54,13 @@ class FinancialGraphRAGPipeline:
             chunk_overlap=chunk_overlap,
         )
         graph_config = GraphConfig(db_path=graph_db_path)
-        self.graph = GraphPipeline(llm=llm, graph_config=graph_config)
+        self.graph = GraphPipeline(
+            llm=llm,
+            graph_config=graph_config,
+            max_workers=graph_max_workers,
+            batch_size=graph_batch_size,
+            save_every=graph_save_every,
+        )
         self.retrieval = RetrievalPipeline(
             llm=llm,
             graph_schema=self.graph.schema,

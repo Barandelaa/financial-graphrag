@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -202,16 +204,21 @@ class GraphPipeline:
         llm: BaseChatModel,
         graph_config: Optional[GraphConfig] = None,
         triplets_cache_dir: str | Path = "data/processed_chunks",
+        max_workers: int = 4,
+        batch_size: int = 1,
+        save_every: int = 1,
     ) -> None:
         self.llm = llm
         self.config = graph_config or GraphConfig()
         self.schema = GraphSchema(self.config)
         self.extractor = TripletExtractor(llm=llm)
         self.triplets_cache_dir = Path(triplets_cache_dir)
+        self.max_workers = max_workers
+        self.batch_size = batch_size
+        self.save_every = max(1, save_every)
 
     def process_chunks(self, chunks: List[Chunk]) -> List[FinancialTriplet]:
         all_triplets: List[FinancialTriplet] = []
-
         conn = self.schema.connection
 
         groups: Dict[tuple[str, int], List[Chunk]] = {}
@@ -222,8 +229,8 @@ class GraphPipeline:
 
         for (ticker, year), group_chunks in groups.items():
             cache = self._load_triplets_cache(ticker, year)
-            new_entries: Dict[str, List[FinancialTriplet]] = {}
-
+            pending: List[Chunk] = []
+            # 1) upsert inmediatemente los cacheados (rápido, sin LLM)
             for chunk in group_chunks:
                 if chunk.chunk_id in cache:
                     triplets = cache[chunk.chunk_id]
@@ -232,23 +239,128 @@ class GraphPipeline:
                         len(triplets),
                         chunk.chunk_id,
                     )
+                    self._upsert_chunk(conn, chunk)
+                    self._upsert_triplets(conn, chunk, triplets)
+                    all_triplets.extend(triplets)
                 else:
-                    triplets = self.extractor.extract_from_chunk(
-                        chunk_text=chunk.text,
-                        ticker=chunk.company_ticker,
-                        year=chunk.fiscal_year,
-                        section_id=chunk.section_id,
-                        chunk_id=chunk.chunk_id,
-                    )
-                    new_entries[chunk.chunk_id] = triplets
+                    pending.append(chunk)
 
-                self._upsert_chunk(conn, chunk)
-                self._upsert_triplets(conn, chunk, triplets)
-                all_triplets.extend(triplets)
+            if not pending:
+                logger.info("Graph pipeline: all %d chunks cached for %s / %s", len(group_chunks), ticker, year)
+                try:
+                    conn.execute("CHECKPOINT")
+                except RuntimeError as exc:
+                    logger.debug("Kùzu checkpoint skipped: %s", exc)
+                continue
 
+            logger.info(
+                "Graph pipeline: extracting %d pending chunks for %s / %s (batch=%d, workers=%d)",
+                len(pending),
+                ticker,
+                year,
+                self.batch_size,
+                self.max_workers,
+            )
+            t0 = time.time()
+            # 2) Agrupa pendientes en lotes
+            batches: List[List[Chunk]] = [
+                pending[i : i + self.batch_size] for i in range(0, len(pending), self.batch_size)
+            ]
+            new_entries: Dict[str, List[FinancialTriplet]] = {}
+            completed_batches = 0
+            failed_chunks = 0
+
+            # Mapa chunk_id -> Chunk para upsert ordenado
+            chunk_by_id: Dict[str, Chunk] = {c.chunk_id: c for c in pending}
+
+            if self.max_workers > 1 and len(batches) > 1:
+                # Paralelo: cada worker procesa un batch (varias llamadas LLM en paralelo)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    future_to_batch = {}
+                    for batch in batches:
+                        # Convierte batch a formato dict para extractor
+                        batch_dicts = [
+                            {"chunk_id": c.chunk_id, "text": c.text, "section_id": c.section_id}
+                            for c in batch
+                        ]
+                        fut = executor.submit(self.extractor.extract_from_batch, batch_dicts, ticker, year)
+                        future_to_batch[fut] = batch
+
+                    for fut in concurrent.futures.as_completed(future_to_batch):
+                        batch = future_to_batch[fut]
+                        try:
+                            result_map = fut.result()
+                        except Exception as exc:
+                            logger.error("Batch failed unexpectedly (%d chunks): %s", len(batch), exc)
+                            result_map = {}
+                            for c in batch:
+                                # fallback individual ya está dentro de extract_from_batch, pero por si acaso
+                                result_map[c.chunk_id] = []
+
+                        # Upsert serializado (Kùzu no es thread-safe)
+                        for chunk in batch:
+                            cid = chunk.chunk_id
+                            triplets = result_map.get(cid, [])
+                            # Si batch devolvió vacío pero chunk no era skippable, cuenta como posible fallo
+                            if not triplets and cid not in result_map:
+                                failed_chunks += 1
+                            self._upsert_chunk(conn, chunk)
+                            self._upsert_triplets(conn, chunk, triplets)
+                            all_triplets.extend(triplets)
+                            new_entries[cid] = triplets
+                            # si no estaba en result_map y era skippable, extractor ya lo maneja
+
+                        completed_batches += 1
+                        # Guardado incremental cada save_every batches + siempre al final
+                        if completed_batches % self.save_every == 0:
+                            cache.update(new_entries)
+                            self._save_triplets_cache(ticker, year, cache)
+                            # no limpiar new_entries para no perder referencia; se sigue acumulando
+                            logger.info(
+                                "Progress %s/%s: %d/%d batches (%d chunks) — elapsed %.1fs",
+                                ticker,
+                                year,
+                                completed_batches,
+                                len(batches),
+                                completed_batches * self.batch_size,
+                                time.time() - t0,
+                            )
+            else:
+                # Secuencial (batch_size puede ser >1 aun sin workers)
+                for batch in batches:
+                    batch_dicts = [
+                        {"chunk_id": c.chunk_id, "text": c.text, "section_id": c.section_id}
+                        for c in batch
+                    ]
+                    result_map = self.extractor.extract_from_batch(batch_dicts, ticker, year)
+                    for chunk in batch:
+                        cid = chunk.chunk_id
+                        triplets = result_map.get(cid, [])
+                        self._upsert_chunk(conn, chunk)
+                        self._upsert_triplets(conn, chunk, triplets)
+                        all_triplets.extend(triplets)
+                        new_entries[cid] = triplets
+                    completed_batches += 1
+                    if completed_batches % self.save_every == 0:
+                        cache.update(new_entries)
+                        self._save_triplets_cache(ticker, year, cache)
+
+            # Guardado final del grupo
             if new_entries:
                 cache.update(new_entries)
                 self._save_triplets_cache(ticker, year, cache)
+
+            elapsed = time.time() - t0
+            avg_ms = (elapsed / max(1, len(pending))) * 1000
+            logger.info(
+                "Graph pipeline: extracted %d chunks for %s/%s in %.1fs (avg %.0f ms/chunk, failed~%d)",
+                len(pending),
+                ticker,
+                year,
+                elapsed,
+                avg_ms,
+                failed_chunks,
+            )
 
             try:
                 conn.execute("CHECKPOINT")
@@ -297,8 +409,11 @@ class GraphPipeline:
             self._triplet_to_dict(chunk_id, triplets)
             for chunk_id, triplets in sorted(cache.items())
         ]
-        with open(path, "w", encoding="utf-8") as f:
+        # Escritura atómica: escribe a tmp y renombra
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
+        tmp.replace(path)
         logger.info(
             "Persisted %d chunk triplets to %s", len(records), path
         )

@@ -47,6 +47,11 @@ def create_llm(
     ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL,
     groq_model: str = DEFAULT_GROQ_MODEL,
     prefer_ollama: bool = True,
+    num_predict: int = 1200,
+    num_ctx: int = 8192,
+    keep_alive: str = "10m",
+    num_thread: Optional[int] = None,
+    timeout: int = 180,
 ) -> BaseChatModel:
     if prefer_ollama and _ollama_available(ollama_base_url, ollama_model):
         try:
@@ -54,12 +59,40 @@ def create_llm(
         except ImportError:
             from langchain_community.chat_models import ChatOllama
 
-        logger.info("Using local Ollama model: %s", ollama_model)
-        return ChatOllama(
+        logger.info(
+            "Using local Ollama model: %s (num_predict=%d, num_ctx=%d, keep_alive=%s)",
+            ollama_model,
+            num_predict,
+            num_ctx,
+            keep_alive,
+        )
+        kwargs: dict = dict(
             model=ollama_model,
             base_url=ollama_base_url,
             temperature=0.0,
+            num_predict=num_predict,
+            num_ctx=num_ctx,
+            keep_alive=keep_alive,
+            timeout=timeout,
+            format="json",
+            # qwen3: desactiva thinking (<think> vacía JSON y explica tus Invalid json output)
+            reasoning=False,
         )
+        if num_thread is not None:
+            kwargs["num_thread"] = num_thread
+        try:
+            return ChatOllama(**kwargs)
+        except TypeError as exc:
+            if "reasoning" in str(exc) or "think" in str(exc):
+                kwargs.pop("reasoning", None)
+                kwargs.pop("think", None)
+                logger.debug("ChatOllama no soporta reasoning param, reintenta sin él: %s", exc)
+                # último intento con think como alias
+                try:
+                    return ChatOllama(**kwargs, think=False)  # type: ignore
+                except TypeError:
+                    return ChatOllama(**kwargs)
+            raise
 
     from langchain_groq import ChatGroq
 
