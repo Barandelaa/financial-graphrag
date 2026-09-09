@@ -42,20 +42,24 @@ def build_agent(pipeline: FinancialGraphRAGPipeline):
 
 def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True) -> None:
     print("=" * 60)
-    print("Financial GraphRAG - Chat interactivo (LangGraph determinista single-turn)")
-    print("Escribe una pregunta, 'añade AAPL 2026' para ingesta con confirmación, o /help.")
+    print("Financial GraphRAG - Chat interactivo (LangGraph con memoria Q/A)")
+    print("Recuerda preguntas/respuestas previas (no chunks). Escribe 'añade AAPL 2026' para ingesta con confirmación, o /help.")
     print("=" * 60)
 
     agent = None
     if use_agent:
         try:
             agent = build_agent(pipeline)
-            print("[Agent LangGraph activo: intent classify + HITL ingest_tool]")
+            print("[Agent LangGraph activo: memoria Q/A + intent classify + HITL ingest_tool]")
         except Exception as exc:
             logger.warning("No se pudo inicializar agente, fallback a pipeline directo: %s", exc)
             agent = None
 
     import uuid
+
+    # thread_id persistente para memoria conversacional (no uuid por pregunta)
+    conversation_thread_id = str(uuid.uuid4())
+    print(f"[Memoria conversacional: thread {conversation_thread_id[:8]} | /clear limpia historial]")
 
     while True:
         try:
@@ -71,10 +75,13 @@ def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True) -> Non
             print("Saliendo...")
             break
         if question == "/help":
-            print(HELP_TEXT + "\n\nModo agente: escribe 'añade TICKER AÑO' (ej: añade AAPL 2026) para ingesta con confirmación.")
+            print(HELP_TEXT + "\n\nModo agente: escribe 'añade TICKER AÑO' (ej: añade AAPL 2026) para ingesta con confirmación.\nMemoria: recuerda últimas Q/A para '¿y en 2023?' sin repetir ticker.")
             continue
         if question == "/clear":
             print("\033c", end="")
+            # limpia memoria conversacional
+            conversation_thread_id = str(uuid.uuid4())
+            print(f"[Memoria limpiada, nuevo thread {conversation_thread_id[:8]}]")
             continue
         if question == "/ingest-all":
             print("Ingiriendo todas las empresas del config...")
@@ -99,12 +106,11 @@ def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True) -> Non
             print(f"Comando desconocido: {question}")
             continue
 
-        # LangGraph agent path con HITL (si disponible y pregunta no es comando)
+        # LangGraph agent path con HITL y memoria conversacional
         if agent is not None:
             print("\nConsultando (agent)...\n")
             try:
-                thread_id = str(uuid.uuid4())
-                config = {"configurable": {"thread_id": thread_id}}
+                config = {"configurable": {"thread_id": conversation_thread_id}}
                 # 1º invoke hasta interrupt_before ingest_tool o END
                 result = agent.invoke({"question": question}, config=config)
                 # Si hay interrupt (ingest), result contiene ingest_request pendiente
@@ -131,12 +137,12 @@ def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True) -> Non
                                 print(m.content)
                     else:
                         print("Ingesta cancelada, haciendo retrieval en su lugar...")
-                        # cancela ingest y fuerza retrieve: invoca grafo no-interrupt
+                        # cancela ingest y fuerza retrieve con mismo thread (mantiene memoria)
                         from src.agent.graph import build_agent_graph_no_interrupt
 
                         agent2 = build_agent_graph_no_interrupt(pipeline)
                         # fuerza intent retrieve
-                        result = agent2.invoke({"question": question, "intent": "retrieve", "ticker": None, "year": None}, config={"configurable": {"thread_id": str(uuid.uuid4())}})
+                        result = agent2.invoke({"question": question, "intent": "retrieve", "ticker": None, "year": None}, config={"configurable": {"thread_id": conversation_thread_id}})
                         answer = result.get("answer", "")
                         citations = result.get("citations", [])
                         facts = result.get("graph_facts", [])

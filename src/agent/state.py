@@ -14,7 +14,7 @@ class AgentState(TypedDict, total=False):
     year: Optional[int]
     confidence: float
     expanded_query: str
-    # retrieval
+    # retrieval (no se guarda en checkpoint para ahorrar VRAM)
     dense: List[dict]
     sparse: List[dict]
     graph: List[dict]
@@ -28,5 +28,8 @@ class AgentState(TypedDict, total=False):
     # ingest HITL
     ingest_request: Optional[dict]
     ingest_result: Optional[str]
-    # para langgraph messages (no usado en single-turn pero útil para debug)
+    # memoria conversacional: solo Q/A, no chunks/triplets (ver impacto en docs)
     messages: Annotated[List[dict], add_messages]
+    # historial ligero para resolver "¿y en 2023?" sin re-preguntar ticker
+    history_ticker: Optional[str]
+    history_year: Optional[int]

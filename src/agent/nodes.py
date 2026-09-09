@@ -43,6 +43,32 @@ def _strip_thinking(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
 
 
+def _resolve_from_history(state: dict) -> tuple[str | None, int | None]:
+    """Resuelve ticker/año desde historial Q/A si la pregunta actual es follow-up tipo '¿y en 2023?'."""
+    # busca en history_ticker/history_year guardados + messages previos
+    hist_ticker = state.get("history_ticker")
+    hist_year = state.get("history_year")
+    if hist_ticker:
+        return hist_ticker, hist_year
+    # fallback: escanea últimos messages (HumanMessage/AIMessage dicts)
+    msgs = state.get("messages", [])
+    # recorre al revés buscando ticker en preguntas previas
+    for m in reversed(msgs):
+        content = ""
+        if isinstance(m, dict):
+            content = m.get("content", "") or m.get("text", "")
+            if m.get("type") == "human" or m.get("role") == "user":
+                t, y = extract_ticker_year_fallback(content)
+                if t:
+                    return t, y
+        elif hasattr(m, "content"):
+            content = getattr(m, "content", "")
+            t, y = extract_ticker_year_fallback(content)
+            if t:
+                return t, y
+    return None, None
+
+
 def classify_intent_node(llm, state: dict) -> dict:
     question = state.get("question", "")
     # LLM gating 100% local
@@ -75,20 +101,35 @@ def classify_intent_node(llm, state: dict) -> dict:
             fb_t, fb_y = extract_ticker_year_fallback(question)
             ticker = ticker or fb_t
             year = year or fb_y
+        # Para retrieve follow-up tipo "¿y en 2023?" resuelve ticker desde historial
+        if intent == "retrieve" and not ticker:
+            hist_t, hist_y = _resolve_from_history(state)
+            if hist_t:
+                ticker = hist_t
+                # si la pregunta trae año explícito, úsalo; si no, mantén hist
+                if not year and hist_y:
+                    # extrae año de la pregunta actual si existe
+                    _, cur_y = extract_ticker_year_fallback(question)
+                    year = cur_y or hist_y
         # umbral confianza
         if conf < 0.55:
             intent = "retrieve"
-        return {"intent": intent, "ticker": ticker, "year": year, "confidence": conf}
+        return {"intent": intent, "ticker": ticker, "year": year, "confidence": conf, "history_ticker": ticker, "history_year": year}
     except Exception as exc:
         logger.debug("classify_intent fallback to regex: %s", exc)
         # Edge case: LLM falla → regex conservador: solo ingest si verbo explícito
-        low = question.lower()
+        low = (question or "").strip().lower()
         has_ingest_verb = any(v in low for v in ["añade", "añadir", "ingesta", "ingestar", "agrega", "agregar", "add ", "ingest"])
         has_negation = "no quiero que añadas" in low or "no añadas" in low or "no agregues" in low
         if has_ingest_verb and not has_negation:
             t, y = extract_ticker_year_fallback(question)
             if t and y:
-                return {"intent": "ingest", "ticker": t, "year": y, "confidence": 0.6}
+                return {"intent": "ingest", "ticker": t, "year": y, "confidence": 0.6, "history_ticker": t, "history_year": y}
+        # follow-up retrieve desde historial
+        hist_t, hist_y = _resolve_from_history(state)
+        if hist_t:
+            _, cur_y = extract_ticker_year_fallback(question)
+            return {"intent": "retrieve", "ticker": hist_t, "year": cur_y or hist_y, "confidence": 0.5, "history_ticker": hist_t, "history_year": cur_y or hist_y}
         return {"intent": "retrieve", "ticker": None, "year": None, "confidence": 0.5}
 
 
@@ -103,12 +144,18 @@ def extract_entities_node(pipeline, state: dict) -> dict:
 def parallel_retrieve_node(pipeline, state: dict) -> dict:
     rp = getattr(pipeline, "retrieval", pipeline)
     question = state.get("question", "")
-    expanded = rp._expand_query(question)
+    # Si es follow-up tipo "¿y en 2023?" sin ticker, usa history_ticker para expandir query y metrics
+    hist_ticker = state.get("history_ticker") or state.get("ticker")
+    effective_question = question
+    if hist_ticker and not rp._query_tickers(question):
+        # ante follow-up, antepone ticker histórico para retrieval scoping
+        effective_question = f"{hist_ticker} {question}"
+    expanded = rp._expand_query(effective_question)
     dense = rp.dense.search(expanded, top_k=rp.top_k_dense)
     sparse = rp.sparse.search(expanded, top_k=rp.top_k_sparse)
     graph = rp.graph.search(expanded, top_k=rp.top_k_graph)
-    facts = rp.graph_facts_retriever.search(question, top_k=rp.max_facts)
-    metrics_rows = rp.metrics_retriever.search(question)
+    facts = rp.graph_facts_retriever.search(effective_question, top_k=rp.max_facts)
+    metrics_rows = rp.metrics_retriever.search(effective_question)
     metrics_block = rp.metrics_retriever.format_as_block(metrics_rows)
     # serializa para estado (dict)
     return {
@@ -167,6 +214,26 @@ def fuse_rerank_node(pipeline, state: dict) -> dict:
     return {"fused": [r.__dict__ for r in fused], "reranked": [r.__dict__ for r in reranked]}
 
 
+def _history_messages_block(state: dict, max_turns: int = 4) -> str:
+    """Solo Q/A previos, no chunks. Limita a últimos max_turns para no saturar 8192 ctx."""
+    msgs = state.get("messages", [])
+    # Filtra solo human/ai, toma últimos max_turns*2 mensajes
+    qa = []
+    for m in msgs[-max_turns*2:]:
+        if isinstance(m, dict):
+            role = m.get("type") or m.get("role", "")
+            content = m.get("content", "")[:500]  # trunca cada mensaje
+            if role in ("human", "user"):
+                qa.append(f"Prev Q: {content}")
+            elif role in ("ai", "assistant"):
+                qa.append(f"Prev A: {content}")
+        elif hasattr(m, "content"):
+            # AIMessage/HumanMessage
+            role = getattr(m, "type", "")
+            qa.append(f"{role}: {str(m.content)[:500]}")
+    return "\n".join(qa) if qa else "(no history)"
+
+
 def generate_node(pipeline, state: dict) -> dict:
     from src.retrieval.reranker import RerankedResult
     rp = getattr(pipeline, "retrieval", pipeline)
@@ -175,10 +242,21 @@ def generate_node(pipeline, state: dict) -> dict:
     for d in state.get("reranked", []):
         # d ya es dict con chunk_id, text, score, metadata
         reranked_objs.append(RerankedResult(chunk_id=d["chunk_id"], text=d["text"], score=d.get("score", 0), metadata=d.get("metadata", {})))
+    # historial ligero Q/A para follow-ups
+    history_block = _history_messages_block(state, max_turns=4)
+    # antepone historial a la pregunta si hay follow-up
+    question = state.get("question", "")
+    if "Prev Q:" in history_block and len(history_block) > 20:
+        question = f"Conversation history:\n{history_block}\n\nCurrent question: {question}"
     gen = rp.generator.generate(
-        question=state.get("question", ""),
+        question=question,
         context=reranked_objs,
         graph_facts=state.get("graph_facts", []),
         metrics_table=state.get("metrics_block", ""),
     )
-    return {"answer": gen.answer, "citations": gen.citations}
+    # Guarda Q/A en messages para próximo turno (solo Q/A, no chunks)
+    new_messages = [
+        {"type": "human", "role": "user", "content": state.get("question", "")},
+        {"type": "ai", "role": "assistant", "content": gen.answer[:2000]},
+    ]
+    return {"answer": gen.answer, "citations": gen.citations, "messages": new_messages}
