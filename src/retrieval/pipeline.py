@@ -12,6 +12,7 @@ from src.retrieval.dense import DenseRetriever
 from src.retrieval.generator import GenerationResponse, ResponseGenerator
 from src.retrieval.graph_facts import GraphFactRetriever
 from src.retrieval.graph_traversal import GraphTraversalRetriever
+from src.retrieval.metrics_table import MetricsTableRetriever
 from src.retrieval.reranker import CrossEncoderReranker, RerankedResult
 from src.retrieval.rrf import FusedResult, ReciprocalRankFusion
 from src.retrieval.sparse import SparseRetriever
@@ -28,6 +29,7 @@ class RetrievalResult:
     sparse_results: int = 0
     graph_results: int = 0
     graph_facts: List[str] = field(default_factory=list)
+    metrics_rows: List[dict] = field(default_factory=list)
     final_context: List[RerankedResult] = field(default_factory=list)
 
 
@@ -69,6 +71,7 @@ class RetrievalPipeline:
         self.graph_facts_retriever = GraphFactRetriever(
             schema=graph_schema, traversal=self.graph
         )
+        self.metrics_retriever = MetricsTableRetriever(schema=graph_schema)
         self.fusion = ReciprocalRankFusion(k=rrf_k)
         self.reranker = CrossEncoderReranker(model_name=reranker_model)
         self.generator = ResponseGenerator(llm=llm)
@@ -93,20 +96,43 @@ class RetrievalPipeline:
             len(records),
         )
 
+    _METRIC_SYNONYMS = {
+        "revenue": "net sales total net sales sales revenues total revenues net revenue",
+        "net income": "net earnings profit earnings",
+        "operating income": "operating profit income from operations",
+        "eps": "earnings per share diluted eps",
+        "total assets": "assets",
+    }
+
+    def _expand_query(self, question: str) -> str:
+        q_low = question.lower()
+        extras = []
+        for canon, syns in self._METRIC_SYNONYMS.items():
+            if canon in q_low:
+                extras.append(syns)
+        if extras:
+            return question + " " + " ".join(extras)
+        return question
+
     def query(self, question: str) -> RetrievalResult:
-        dense_results = self.dense.search(question, top_k=self.top_k_dense)
-        sparse_results = self.sparse.search(question, top_k=self.top_k_sparse)
-        graph_results = self.graph.search(question, top_k=self.top_k_graph)
+        expanded = self._expand_query(question)
+        dense_results = self.dense.search(expanded, top_k=self.top_k_dense)
+        sparse_results = self.sparse.search(expanded, top_k=self.top_k_sparse)
+        graph_results = self.graph.search(expanded, top_k=self.top_k_graph)
         graph_facts = self.graph_facts_retriever.search(
             question, top_k=self.max_facts
         )
 
+        metrics_rows = self.metrics_retriever.search(question)
+        metrics_block = self.metrics_retriever.format_as_block(metrics_rows)
+
         logger.debug(
-            "Retrieval counts — dense=%d sparse=%d graph=%d facts=%d",
+            "Retrieval counts — dense=%d sparse=%d graph=%d facts=%d metrics=%d",
             len(dense_results),
             len(sparse_results),
             len(graph_results),
             len(graph_facts),
+            len(metrics_rows),
         )
 
         fused = self.fusion.fuse(
@@ -134,6 +160,7 @@ class RetrievalPipeline:
             question=question,
             context=final_context,
             graph_facts=graph_facts,
+            metrics_table=metrics_block,
         )
 
         return RetrievalResult(
@@ -144,6 +171,7 @@ class RetrievalPipeline:
             sparse_results=len(sparse_results),
             graph_results=len(graph_results),
             graph_facts=graph_facts,
+            metrics_rows=[r.__dict__ for r in metrics_rows],
             final_context=final_context,
         )
 

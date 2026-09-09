@@ -23,7 +23,8 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
             "relationships from the text below. Use ONLY the ontology provided.\n\n"
             "ENTITY TYPES:\n"
             "- Company: a public corporation identified by ticker\n"
-            "- FinancialMetric: a numeric metric (revenue, net income, EPS, etc.)\n"
+            "- FinancialMetric: a numeric metric (revenue, net income, EPS, etc.) — "
+            "ALWAYS include value/unit when a number is present in the text\n"
             "- RiskFactor: a disclosed risk or uncertainty\n"
             "- BusinessSegment: an operating or reportable segment\n"
             "- MacroEvent: a macroeconomic or geopolitical event\n\n"
@@ -35,12 +36,15 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
             "- competes_with: Company -> Company\n\n"
             "Respond ONLY with a JSON object in the following shape, without extra text:\n"
             '{{"triplets": [{{"source": {{"name": "..."}}, "relation": "...", '
-            '"target": {{"name": "..."}}}}]}}\n\n'
+            '"target": {{"name": "...", "value": "...", "unit": "..."}}}}]}}\n\n'
             "Rules:\n"
             "- Do NOT use <think> tags. Do NOT explain.\n"
             "- Use the exact relation names above.\n"
             "- The source must be the company ticker where the relation is "
             "Company -> X (e.g. operates_in, reported_metric).\n"
+            "- For FinancialMetric targets, add \"value\" and \"unit\" when the text gives a number "
+            "(e.g. {{\"name\":\"total net sales\",\"value\":\"383285\",\"unit\":\"USD millions\"}}). "
+            "If no number, omit value/unit.\n"
             "- Only include entities explicitly mentioned in the text.\n"
             "- Omit relations when the target is unknown.",
         ),
@@ -61,7 +65,7 @@ BATCH_EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
             "system",
             "/no_think You are an expert financial analyst extracting structured knowledge "
             "from SEC 10-K reports. Use ONLY the ontology below.\n\n"
-            "ENTITY TYPES: Company (ticker), FinancialMetric, RiskFactor, "
+            "ENTITY TYPES: Company (ticker), FinancialMetric (with value/unit when numeric), RiskFactor, "
             "BusinessSegment, MacroEvent\n"
             "RELATIONSHIP TYPES: operates_in (Company->BusinessSegment), "
             "reported_metric (Company->FinancialMetric), "
@@ -70,10 +74,11 @@ BATCH_EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
             "competes_with (Company->Company)\n\n"
             "You will receive N chunks, each prefixed with CHUNK_ID and SECTION.\n"
             "Do NOT use <think> tags. Do NOT add explanations. Return ONLY a JSON object with this exact shape, no extra text:\n"
-            '{{\"results\": [{{\"chunk_id\": \"...\", \"triplets\": [{{\"source\": {{\"name\": \"...\"}}, \"relation\": \"...\", \"target\": {{\"name\": \"...\"}}}}]}}]}}\n\n'
+            '{{\"results\": [{{\"chunk_id\": \"...\", \"triplets\": [{{\"source\": {{\"name\": \"...\"}}, \"relation\": \"...\", \"target\": {{\"name\": \"...\", \"value\": \"...\", \"unit\": \"...\"}}}}]}}]}}\n\n'
             "Rules:\n"
             "- One entry per input chunk_id, even if no triplets (use empty list).\n"
             "- For Company->X relations, source must be the company ticker.\n"
+            "- For FinancialMetric targets, add value/unit when the text gives a number.\n"
             "- Only include entities explicitly mentioned in that chunk.\n"
             "- Use exact relation names listed above.",
         ),
@@ -453,9 +458,9 @@ class TripletExtractor:
     @staticmethod
     def _triplet_to_raw_dict(triplet: Triplet) -> dict:
         return {
-            "source": {"name": triplet.source_entity.name},
+            "source": {"name": triplet.source_entity.name, **triplet.source_entity.properties},
             "relation": triplet.relation.value,
-            "target": {"name": triplet.target_entity.name},
+            "target": {"name": triplet.target_entity.name, **triplet.target_entity.properties},
         }
 
     def _extract_json_object(self, text: str):
@@ -570,9 +575,9 @@ class TripletExtractor:
                 raise ValueError(f"Array triplet too short: {item}")
             src, rel, tgt = item[0], item[1], item[2]
             return {
-                "source": {"name": src},
+                "source": {"name": src} if not isinstance(src, dict) else src,
                 "relation": rel,
-                "target": {"name": tgt},
+                "target": {"name": tgt} if not isinstance(tgt, dict) else tgt,
             }
         src = item.get("source_entity") or item.get("source") or {}
         tgt = item.get("target_entity") or item.get("target") or {}
@@ -580,6 +585,11 @@ class TripletExtractor:
             src = {"name": src}
         if isinstance(tgt, str):
             tgt = {"name": tgt}
+        # preserva value/unit si el LLM los devolvió para FinancialMetric
+        for ent in (src, tgt):
+            if isinstance(ent, dict):
+                extra = {k: str(v).strip() for k, v in ent.items() if k in ("value", "unit", "fiscal_year") and v not in (None, "")}
+                ent.update(extra)
         return {
             "source": src,
             "relation": item.get("relation"),
@@ -590,13 +600,19 @@ class TripletExtractor:
         triplets: List[Triplet] = []
         for item in raw:
             try:
+                src_raw = item["source"] or {}
+                tgt_raw = item["target"] or {}
+                src_props = {k: v for k, v in src_raw.items() if k not in ("name",) and v not in (None, "")}
+                tgt_props = {k: v for k, v in tgt_raw.items() if k not in ("name",) and v not in (None, "")}
                 source = Entity(
-                    name=item["source"]["name"],
+                    name=src_raw["name"],
                     entity_type=self._infer_entity_type(item["relation"], side="source"),
+                    properties=src_props,
                 )
                 target = Entity(
-                    name=item["target"]["name"],
+                    name=tgt_raw["name"],
                     entity_type=self._infer_entity_type(item["relation"], side="target"),
+                    properties=tgt_props,
                 )
                 triplets.append(
                     Triplet(

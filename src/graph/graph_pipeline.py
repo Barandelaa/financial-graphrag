@@ -178,8 +178,17 @@ def _is_noisy_company(name: str) -> bool:
     return False
 
 
-def _entity_pk_value(entity: Entity) -> Optional[str]:
-    """PK normalizada para un Entity, o None si debe descartarse."""
+def _metric_composite_id(ticker: str, year: int, metric_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", metric_name.strip().lower()).strip("_")[:80]
+    if not slug:
+        slug = "metric"
+    return f"{ticker.upper()}_{year}_{slug}"
+
+
+def _entity_pk_value(entity: Entity, ticker: Optional[str] = None, year: Optional[int] = None) -> Optional[str]:
+    """PK normalizada para un Entity, o None si debe descartarse.
+    Para FinancialMetric genera id compuesto ticker_year_metric para evitar colisión entre empresas.
+    """
     raw = (entity.name or "").strip()
     if not raw:
         return None
@@ -188,6 +197,14 @@ def _entity_pk_value(entity: Entity) -> Optional[str]:
         if norm is None or _is_noisy_company(norm):
             return None
         return norm
+    if entity.entity_type == EntityType.financial_metric:
+        # Si tenemos contexto ticker/year, usa PK compuesto
+        if ticker and year:
+            return _metric_composite_id(ticker, year, raw)
+        # Fallback legacy (solo nombre) — para compatibilidad con datos viejos sin contexto
+        if len(raw) > 300:
+            return None
+        return raw
     # Tickers/alias colados en otras tablas (p.ej. MacroEvent 'AAPL' o
     # BusinessSegment 'Apple') se descartan: pertenecen a Company.
     if _normalize_company_name(raw) in _VALID_TICKERS:
@@ -484,8 +501,11 @@ class GraphPipeline:
     ) -> None:
         seen: set[tuple[str, str, str, str, str]] = set()
         for ft in triplets:
-            src_val = _entity_pk_value(ft.triplet.source_entity)
-            dst_val = _entity_pk_value(ft.triplet.target_entity)
+            # Para FinancialMetric usa PK compuesto ticker_year_metric
+            ticker = ft.company_ticker
+            year = ft.fiscal_year
+            src_val = _entity_pk_value(ft.triplet.source_entity, ticker, year)
+            dst_val = _entity_pk_value(ft.triplet.target_entity, ticker, year)
             if src_val is None or dst_val is None:
                 continue
             if src_val.lower() == dst_val.lower():
@@ -500,8 +520,8 @@ class GraphPipeline:
             if key in seen:
                 continue
             seen.add(key)
-            self._upsert_entity(conn, ft.triplet.source_entity)
-            self._upsert_entity(conn, ft.triplet.target_entity)
+            self._upsert_entity(conn, ft.triplet.source_entity, ticker, year)
+            self._upsert_entity(conn, ft.triplet.target_entity, ticker, year)
             self._upsert_relationship(conn, ft)
             self._upsert_mentions(conn, chunk.chunk_id, ft)
 
@@ -509,20 +529,30 @@ class GraphPipeline:
         self,
         conn: kuzu.Connection,
         entity: Entity,
+        ticker: Optional[str] = None,
+        year: Optional[int] = None,
     ) -> None:
         table = _NODE_TABLE_MAP.get(entity.entity_type)
         if table is None:
             logger.warning("Unknown entity type: %s", entity.entity_type)
             return
 
-        pk_val = _entity_pk_value(entity)
+        pk_val = _entity_pk_value(entity, ticker, year)
         if pk_val is None:
             logger.debug("Skipping noisy/empty entity: %r", entity.name)
             return
 
         pk_field = self._pk_field(table)
         props = dict(entity.properties or {})
-        props["name"] = pk_val
+        # Para FinancialMetric el PK es compuesto pero name debe ser el nombre legible
+        if entity.entity_type == EntityType.financial_metric:
+            props["name"] = (entity.name or "").strip()
+            # Asegura fiscal_year coherente con el chunk
+            if year is not None:
+                props["fiscal_year"] = year
+            # value/unit ya vienen en props desde el extractor; respeta si existen
+        else:
+            props["name"] = pk_val
 
         set_parts = [f"e.{k} = ${k}" for k in props]
         set_clause = "SET " + ", ".join(set_parts) if set_parts else ""
@@ -553,8 +583,10 @@ class GraphPipeline:
         src_pk = self._pk_field(src_table)
         dst_pk = self._pk_field(dst_table)
 
-        src_val = _entity_pk_value(ft.triplet.source_entity)
-        dst_val = _entity_pk_value(ft.triplet.target_entity)
+        ticker = ft.company_ticker
+        year = ft.fiscal_year
+        src_val = _entity_pk_value(ft.triplet.source_entity, ticker, year)
+        dst_val = _entity_pk_value(ft.triplet.target_entity, ticker, year)
         if src_val is None or dst_val is None:
             return
 
@@ -584,13 +616,15 @@ class GraphPipeline:
             ft.triplet.source_entity,
             ft.triplet.target_entity,
         ):
-            self._upsert_single_mention(conn, chunk_id, entity)
+            self._upsert_single_mention(conn, chunk_id, entity, ft.company_ticker, ft.fiscal_year)
 
     def _upsert_single_mention(
         self,
         conn: kuzu.Connection,
         chunk_id: str,
         entity: Entity,
+        ticker: Optional[str] = None,
+        year: Optional[int] = None,
     ) -> None:
         rel_table = _MENTIONS_TABLE_MAP.get(entity.entity_type)
         if rel_table is None:
@@ -600,7 +634,7 @@ class GraphPipeline:
         if dst_table is None:
             return
 
-        entity_name = _entity_pk_value(entity)
+        entity_name = _entity_pk_value(entity, ticker, year)
         if entity_name is None:
             return
 
