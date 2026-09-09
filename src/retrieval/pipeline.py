@@ -163,10 +163,26 @@ class RetrievalPipeline:
             metrics_table=metrics_block,
         )
 
+        # Unifica citas de contexto + métricas scoping (para que chunk_id de métrica aparezca en Citas)
+        citations = list(generation.citations)
+        seen_ids = {c["chunk_id"] for c in citations}
+        for row in metrics_rows:
+            cid = row.chunk_id
+            if cid and cid not in seen_ids:
+                citations.append({
+                    "chunk_id": cid,
+                    "company_ticker": row.ticker,
+                    "fiscal_year": row.year,
+                    "section_id": row.section_id or "Item 8",
+                    "relevance_score": 1.0,
+                    "source": "metrics_table",
+                })
+                seen_ids.add(cid)
+
         return RetrievalResult(
             question=question,
             answer=generation.answer,
-            citations=generation.citations,
+            citations=citations,
             dense_results=len(dense_results),
             sparse_results=len(sparse_results),
             graph_results=len(graph_results),
@@ -175,14 +191,31 @@ class RetrievalPipeline:
             final_context=final_context,
         )
 
+    _COMPANY_ALIAS_TO_TICKER = {
+        "apple": "AAPL", "apples": "AAPL",
+        "microsoft": "MSFT",
+        "amazon": "AMZN",
+        "google": "GOOGL", "alphabet": "GOOGL",
+        "meta": "META", "facebook": "META",
+        "tesla": "TSLA", "nvidia": "NVDA",
+        "berkshire": "BRK.B", "berkshire hathaway": "BRK.B",
+    }
+
     def _query_tickers(self, question: str) -> set[str]:
         try:
             entities = self.graph.match_query_entities(question)
+            tickers = {name for name, entity_type in entities if entity_type == "Company"}
+            if tickers:
+                return tickers
         except Exception:
-            return set()
-        return {
-            name for name, entity_type in entities if entity_type == "Company"
-        }
+            pass
+        # Fallback alias regex para casos como "Apples" / "Apple" que el grafo no matchea por plural
+        import re
+        q_low = (question or "").lower()
+        for alias, ticker in self._COMPANY_ALIAS_TO_TICKER.items():
+            if re.search(r"\b" + re.escape(alias) + r"\b", q_low):
+                return {ticker}
+        return set()
 
     def _ground_to_query(
         self,

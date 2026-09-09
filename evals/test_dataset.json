@@ -2,8 +2,7 @@
   {
     "question": "What was Apple's total net revenue for fiscal year 2023?",
     "ground_truth": "Apple's total net revenue for fiscal year 2023 was $383.3 billion.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "AAPL",
     "expected_year": 2023,
     "expected_section": "Item 7"
@@ -11,8 +10,7 @@
   {
     "question": "What are the principal risk factors disclosed by Microsoft in Item 1A of its 2023 10-K?",
     "ground_truth": "Microsoft discloses risks including competition in cloud computing, cybersecurity threats, economic uncertainty, regulatory changes, intellectual property challenges, and dependence on third-party suppliers.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "MSFT",
     "expected_year": 2023,
     "expected_section": "Item 1A"
@@ -20,8 +18,7 @@
   {
     "question": "How much did Amazon's operating income change from 2022 to 2023?",
     "ground_truth": "Amazon's operating income increased from $12.2 billion in 2022 to $36.9 billion in 2023, a significant improvement driven by cost-cutting measures and AWS growth.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "AMZN",
     "expected_year": 2023,
     "expected_section": "Item 7"
@@ -29,8 +26,7 @@
   {
     "question": "What business segments does Tesla report in its 2023 10-K?",
     "ground_truth": "Tesla reports two operating segments: Automotive and Energy Generation & Storage.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "TSLA",
     "expected_year": 2023,
     "expected_section": "Item 7"
@@ -38,8 +34,7 @@
   {
     "question": "What was NVIDIA's diluted EPS for fiscal year 2024?",
     "ground_truth": "NVIDIA's diluted earnings per share for fiscal year 2024 was $11.93.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "NVDA",
     "expected_year": 2024,
     "expected_section": "Item 8"
@@ -47,8 +42,7 @@
   {
     "question": "How does Google (Alphabet) describe competition in its 2023 10-K?",
     "ground_truth": "Alphabet faces competition in search, advertising, cloud computing, and AI from companies including Microsoft, Amazon, Meta, and various AI startups. Competition is described as intense and based on innovation, user experience, and pricing.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "GOOGL",
     "expected_year": 2023,
     "expected_section": "Item 1A"
@@ -56,8 +50,7 @@
   {
     "question": "What was Meta Platforms' revenue from its Family of Apps segment in 2023?",
     "ground_truth": "Meta's Family of Apps segment generated $131.9 billion in revenue for fiscal year 2023.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "META",
     "expected_year": 2023,
     "expected_section": "Item 7"
@@ -65,8 +58,7 @@
   {
     "question": "What risk factors does Boeing identify regarding its supply chain in its 2023 10-K?",
     "ground_truth": "Boeing identifies risks related to supplier concentration, single-source suppliers, supply chain disruptions, raw material availability, and the financial health of key suppliers as material risk factors.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "BA",
     "expected_year": 2023,
     "expected_section": "Item 1A"
@@ -74,8 +66,7 @@
   {
     "question": "How does JPMorgan Chase describe macroeconomic conditions affecting its business in 2023?",
     "ground_truth": "JPMorgan Chase cites inflation, rising interest rates, geopolitical tensions, potential recession risks, and regulatory changes as key macroeconomic conditions affecting its business in 2023.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "JPM",
     "expected_year": 2023,
     "expected_section": "Item 7"
@@ -83,8 +74,7 @@
   {
     "question": "What was ExxonMobil's total revenue for fiscal year 2023?",
     "ground_truth": "ExxonMobil's total revenue for fiscal year 2023 was $344.6 billion.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "XOM",
     "expected_year": 2023,
     "expected_section": "Item 8"
@@ -92,8 +82,7 @@
   {
     "question": "What segments does Johnson & Johnson operate in according to its 2023 10-K?",
     "ground_truth": "Johnson & Johnson operates in three segments: Innovative Medicine (pharmaceuticals), MedTech (medical devices), and (post-separation) the remaining business structure focuses on Innovative Medicine and MedTech.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "JNJ",
     "expected_year": 2023,
     "expected_section": "Item 1"
@@ -101,8 +90,7 @@
   {
     "question": "What research and development expenses did Pfizer report for 2023?",
     "ground_truth": "Pfizer reported R&D expenses of $13.4 billion for fiscal year 2023.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "PFE",
     "expected_year": 2023,
     "expected_section": "Item 8"
@@ -110,8 +98,7 @@
   {
     "question": "What are Walmart's primary risk factors related to its retail operations?",
     "ground_truth": "Walmart's primary risk factors include economic conditions affecting consumer spending, competition from e-commerce and other retailers, supply chain disruptions, cybersecurity risks, regulatory compliance, and changes in consumer preferences.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "WMT",
     "expected_year": 2024,
     "expected_section": "Item 1A"
@@ -119,8 +106,7 @@
   {
     "question": "How does Berkshire Hathaway describe its insurance operations' performance in 2023?",
     "ground_truth": "Berkshire Hathaway's insurance operations, including GEICO and Berkshire Hathaway Reinsurance, reported strong underwriting results in 2023 driven by higher premium volumes, improved pricing, and favorable loss reserve development.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "BRK.B",
     "expected_year": 2023,
     "expected_section": "Item 7"
@@ -128,10 +114,297 @@
   {
     "question": "What was Coca-Cola's net operating revenue for fiscal year 2023?",
     "ground_truth": "Coca-Cola's net operating revenue for fiscal year 2023 was $45.8 billion.",
-    "reference_contexts": [
-    ],
+    "reference_contexts": [],
     "expected_ticker": "KO",
     "expected_year": 2023,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What was Apple's total net sales for fiscal year 2024?",
+    "ground_truth": "Apple's total net sales for FY2024 were $391,035 million.",
+    "reference_contexts": [],
+    "expected_ticker": "AAPL",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What were Apple's total net sales in fiscal year 2023?",
+    "ground_truth": "Apple's total net sales for FY2023 were $383,285 million.",
+    "reference_contexts": [],
+    "expected_ticker": "AAPL",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "Compare Apple's total net sales 2024 vs 2023",
+    "ground_truth": "2024 $391,035M vs 2023 $383,285M, increase driven by iPhone and Services.",
+    "reference_contexts": [],
+    "expected_ticker": "AAPL",
+    "expected_year": 2024,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What was Apple's operating income for fiscal year 2024?",
+    "ground_truth": "Apple operating income FY2024 ~ $123,216 million.",
+    "reference_contexts": [],
+    "expected_ticker": "AAPL",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "Which business segments does Apple report in its 2024 10-K?",
+    "ground_truth": "Apple reports segments including iPhone, Mac, iPad, Wearables/Home/Accessories and Services; reportable segments Products and Services.",
+    "reference_contexts": [],
+    "expected_ticker": "AAPL",
+    "expected_year": 2024,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "What risk factors does Apple disclose in Item 1A 2024?",
+    "ground_truth": "Macroeconomic conditions, competition, supply chain, cybersecurity, regulatory, and international operations risks.",
+    "reference_contexts": [],
+    "expected_ticker": "AAPL",
+    "expected_year": 2024,
+    "expected_section": "Item 1A"
+  },
+  {
+    "question": "What was Microsoft revenue for fiscal year 2024?",
+    "ground_truth": "Microsoft revenue FY2024 $245,122 million.",
+    "reference_contexts": [],
+    "expected_ticker": "MSFT",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What was Microsoft operating income in 2024?",
+    "ground_truth": "Microsoft operating income FY2024 $109,433 million.",
+    "reference_contexts": [],
+    "expected_ticker": "MSFT",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "Which segments does Microsoft report in 2024?",
+    "ground_truth": "Productivity and Business Processes, Intelligent Cloud, More Personal Computing.",
+    "reference_contexts": [],
+    "expected_ticker": "MSFT",
+    "expected_year": 2024,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "Who does Microsoft compete with according to its 2024 10-K?",
+    "ground_truth": "Apple, Amazon, Google, Meta, and other cloud/service providers.",
+    "reference_contexts": [],
+    "expected_ticker": "MSFT",
+    "expected_year": 2024,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "What was Amazon total net sales for fiscal year 2024?",
+    "ground_truth": "Amazon total net sales FY2024 $637.96 billion.",
+    "reference_contexts": [],
+    "expected_ticker": "AMZN",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What was Amazon net income for 2024?",
+    "ground_truth": "Amazon net income FY2024 ~ $59,248 million.",
+    "reference_contexts": [],
+    "expected_ticker": "AMZN",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "Which segments does Amazon report in 2024?",
+    "ground_truth": "North America, International, and AWS.",
+    "reference_contexts": [],
+    "expected_ticker": "AMZN",
+    "expected_year": 2024,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "What was Alphabet (GOOGL) revenue for fiscal year 2024?",
+    "ground_truth": "Alphabet revenue FY2024 $350,018 million.",
+    "reference_contexts": [],
+    "expected_ticker": "GOOGL",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What was Alphabet operating income in 2024?",
+    "ground_truth": "Alphabet operating income FY2024 ~ $109,000 million.",
+    "reference_contexts": [],
+    "expected_ticker": "GOOGL",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "Who does Alphabet compete with in 2024?",
+    "ground_truth": "Microsoft, Amazon, Meta, Apple in search, ads, cloud and AI.",
+    "reference_contexts": [],
+    "expected_ticker": "GOOGL",
+    "expected_year": 2024,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "What was NVIDIA revenue for fiscal year 2024?",
+    "ground_truth": "NVIDIA revenue FY2024 $79,774 million.",
+    "reference_contexts": [],
+    "expected_ticker": "NVDA",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What was NVIDIA net income for fiscal year 2024?",
+    "ground_truth": "NVIDIA net income FY2024 $29,760 million.",
+    "reference_contexts": [],
+    "expected_ticker": "NVDA",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "Which segments does NVIDIA report in 2024?",
+    "ground_truth": "Compute and Networking, and Graphics.",
+    "reference_contexts": [],
+    "expected_ticker": "NVDA",
+    "expected_year": 2024,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "What was Meta revenue for fiscal year 2024?",
+    "ground_truth": "Meta revenue FY2024 $164,501 million.",
+    "reference_contexts": [],
+    "expected_ticker": "META",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What was Meta net income in 2024?",
+    "ground_truth": "Meta net income FY2024 $39,387 million.",
+    "reference_contexts": [],
+    "expected_ticker": "META",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What were Meta Family of Apps revenues in 2024?",
+    "ground_truth": "Family of Apps revenue FY2024 ~ $162,355 million.",
+    "reference_contexts": [],
+    "expected_ticker": "META",
+    "expected_year": 2024,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What was Tesla revenue for fiscal year 2024?",
+    "ground_truth": "Tesla revenue FY2024 $96,773 million.",
+    "reference_contexts": [],
+    "expected_ticker": "TSLA",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What was Tesla net income for 2024?",
+    "ground_truth": "Tesla net income FY2024 ~ $7,130 million.",
+    "reference_contexts": [],
+    "expected_ticker": "TSLA",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "Which segments does Tesla report in 2024?",
+    "ground_truth": "Automotive and Energy Generation and Storage.",
+    "reference_contexts": [],
+    "expected_ticker": "TSLA",
+    "expected_year": 2024,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "What was Berkshire Hathaway revenue for 2024?",
+    "ground_truth": "Berkshire Hathaway revenue FY2024 $371,433 million.",
+    "reference_contexts": [],
+    "expected_ticker": "BRK.B",
+    "expected_year": 2024,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "How did Berkshire Hathaway insurance underwriting perform in 2024?",
+    "ground_truth": "Strong underwriting results with increased premiums and favorable development.",
+    "reference_contexts": [],
+    "expected_ticker": "BRK.B",
+    "expected_year": 2024,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "Compare AAPL revenue 2024 vs 2023",
+    "ground_truth": "2024 $391,035M vs 2023 $383,285M increase.",
+    "reference_contexts": [],
+    "expected_ticker": "AAPL",
+    "expected_year": 2024,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "Compare MSFT revenue 2024 vs 2023",
+    "ground_truth": "2024 $245,122M vs 2023 $211,915M.",
+    "reference_contexts": [],
+    "expected_ticker": "MSFT",
+    "expected_year": 2024,
+    "expected_section": "Item 7"
+  },
+  {
+    "question": "What was GOOGL revenue in 2025?",
+    "ground_truth": "Alphabet revenue FY2025 ~ $380,000M (estimate).",
+    "reference_contexts": [],
+    "expected_ticker": "GOOGL",
+    "expected_year": 2025,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What segments does GOOGL report in 2025?",
+    "ground_truth": "Google Services, Google Cloud and Other Bets.",
+    "reference_contexts": [],
+    "expected_ticker": "GOOGL",
+    "expected_year": 2025,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "What was NVDA revenue in 2025?",
+    "ground_truth": "NVIDIA revenue FY2025 ~ $130,497M.",
+    "reference_contexts": [],
+    "expected_ticker": "NVDA",
+    "expected_year": 2025,
+    "expected_section": "Item 8"
+  },
+  {
+    "question": "What risk factors does Apple disclose in 2024 Item 1A?",
+    "ground_truth": "Competition, supply chain, macroeconomic, cybersecurity, regulatory, international operations.",
+    "reference_contexts": [],
+    "expected_ticker": "AAPL",
+    "expected_year": 2024,
+    "expected_section": "Item 1A"
+  },
+  {
+    "question": "What risk factors does Amazon disclose in 2024?",
+    "ground_truth": "Competition, fulfillment, AWS dependency, regulatory, supply chain, macroeconomic.",
+    "reference_contexts": [],
+    "expected_ticker": "AMZN",
+    "expected_year": 2024,
+    "expected_section": "Item 1A"
+  },
+  {
+    "question": "Who does Amazon compete with?",
+    "ground_truth": "Walmart, other retailers, AWS competitors like Microsoft and Google.",
+    "reference_contexts": [],
+    "expected_ticker": "AMZN",
+    "expected_year": 2024,
+    "expected_section": "Item 1"
+  },
+  {
+    "question": "What was TSLA automotive revenue share in 2024?",
+    "ground_truth": "Automotive revenue ~ $77.1B of total $96.7B.",
+    "reference_contexts": [],
+    "expected_ticker": "TSLA",
+    "expected_year": 2024,
     "expected_section": "Item 7"
   }
 ]

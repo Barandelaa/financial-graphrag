@@ -36,15 +36,21 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
             "- competes_with: Company -> Company\n\n"
             "Respond ONLY with a JSON object in the following shape, without extra text:\n"
             '{{"triplets": [{{"source": {{"name": "..."}}, "relation": "...", '
-            '"target": {{"name": "...", "value": "...", "unit": "..."}}}}]}}\n\n'
+            '"target": {{"name": "...", "value": "...", "unit": "...", "year": "2024"}}}}]}}\n\n'
+            "Examples:\n"
+            "- Text: \"Total net sales | $ 391,035 | $ 383,285\" with header \"2024 | 2023\" → "
+            "produce TWO triplets: {{\"name\":\"total net sales\",\"value\":\"391035\",\"unit\":\"USD millions\",\"year\":\"2024\"}} and "
+            "{{\"name\":\"total net sales\",\"value\":\"383285\",\"unit\":\"USD millions\",\"year\":\"2023\"}}\n"
+            "- Text: \"Net income was $99,800 for fiscal year 2024\" → {{\"name\":\"net income\",\"value\":\"99800\",\"unit\":\"USD millions\",\"year\":\"2024\"}}\n\n"
             "Rules:\n"
             "- Do NOT use <think> tags. Do NOT explain.\n"
             "- Use the exact relation names above.\n"
             "- The source must be the company ticker where the relation is "
             "Company -> X (e.g. operates_in, reported_metric).\n"
             "- For FinancialMetric targets, add \"value\" and \"unit\" when the text gives a number "
-            "(e.g. {{\"name\":\"total net sales\",\"value\":\"383285\",\"unit\":\"USD millions\"}}). "
-            "If no number, omit value/unit.\n"
+            "(e.g. {{\"name\":\"total net sales\",\"value\":\"383285\",\"unit\":\"USD millions\",\"year\":\"2023\"}}). "
+            "CRITICAL for tables: if the chunk contains a table with multiple year columns (e.g., \"2024 | 2023\"), "
+            "create ONE triplet per year column, mapping each value to its column year. Do NOT assign all values to filing year.\n"
             "- Only include entities explicitly mentioned in the text.\n"
             "- Omit relations when the target is unknown.",
         ),
@@ -65,7 +71,7 @@ BATCH_EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
             "system",
             "/no_think You are an expert financial analyst extracting structured knowledge "
             "from SEC 10-K reports. Use ONLY the ontology below.\n\n"
-            "ENTITY TYPES: Company (ticker), FinancialMetric (with value/unit when numeric), RiskFactor, "
+            "ENTITY TYPES: Company (ticker), FinancialMetric (with value/unit/year when numeric), RiskFactor, "
             "BusinessSegment, MacroEvent\n"
             "RELATIONSHIP TYPES: operates_in (Company->BusinessSegment), "
             "reported_metric (Company->FinancialMetric), "
@@ -74,11 +80,11 @@ BATCH_EXTRACTION_PROMPT = ChatPromptTemplate.from_messages(
             "competes_with (Company->Company)\n\n"
             "You will receive N chunks, each prefixed with CHUNK_ID and SECTION.\n"
             "Do NOT use <think> tags. Do NOT add explanations. Return ONLY a JSON object with this exact shape, no extra text:\n"
-            '{{\"results\": [{{\"chunk_id\": \"...\", \"triplets\": [{{\"source\": {{\"name\": \"...\"}}, \"relation\": \"...\", \"target\": {{\"name\": \"...\", \"value\": \"...\", \"unit\": \"...\"}}}}]}}]}}\n\n'
+            '{{\"results\": [{{\"chunk_id\": \"...\", \"triplets\": [{{\"source\": {{\"name\": \"...\"}}, \"relation\": \"...\", \"target\": {{\"name\": \"...\", \"value\": \"...\", \"unit\": \"...\", \"year\": \"2024\"}}}}]}}]}}\n\n'
             "Rules:\n"
             "- One entry per input chunk_id, even if no triplets (use empty list).\n"
             "- For Company->X relations, source must be the company ticker.\n"
-            "- For FinancialMetric targets, add value/unit when the text gives a number.\n"
+            "- For FinancialMetric targets, add value/unit/year when the text gives a number. For tables with 2024|2023 columns, emit one triplet per year.\n"
             "- Only include entities explicitly mentioned in that chunk.\n"
             "- Use exact relation names listed above.",
         ),
@@ -211,6 +217,7 @@ class TripletExtractor:
         for attempt in range(1 + self.max_retries + 1):
             try:
                 raw = self._invoke_single_json(payload)
+                raw = self._enrich_metric_year_fallback(raw, chunk_text, year)
                 parsed = self._parse_triplets(raw)
                 return [
                     FinancialTriplet(
@@ -312,6 +319,11 @@ class TripletExtractor:
         for attempt in range(1 + batch_retries + 1):
             try:
                 raw_by_id = self._invoke_batch_json(payload)
+                # Enrich year fallback por chunk antes de parsear
+                for cid, lst in list(raw_by_id.items()):
+                    meta = id_to_meta.get(cid)
+                    if meta:
+                        raw_by_id[cid] = self._enrich_metric_year_fallback(lst, meta.get("text",""), year)
                 # raw_by_id: dict chunk_id -> List[dict triplets raw]
                 for cid, raw_triplets in raw_by_id.items():
                     meta = id_to_meta.get(cid)
@@ -585,16 +597,57 @@ class TripletExtractor:
             src = {"name": src}
         if isinstance(tgt, str):
             tgt = {"name": tgt}
-        # preserva value/unit si el LLM los devolvió para FinancialMetric
+        # preserva value/unit/year si el LLM los devolvió para FinancialMetric
         for ent in (src, tgt):
             if isinstance(ent, dict):
-                extra = {k: str(v).strip() for k, v in ent.items() if k in ("value", "unit", "fiscal_year") and v not in (None, "")}
+                extra = {k: str(v).strip() for k, v in ent.items() if k in ("value", "unit", "fiscal_year", "year") and v not in (None, "")}
                 ent.update(extra)
         return {
             "source": src,
             "relation": item.get("relation"),
             "target": tgt,
         }
+
+    def _enrich_metric_year_fallback(self, raw: List[dict], chunk_text: str, filing_year: int) -> List[dict]:
+        """Si el LLM no dio year para FinancialMetric, infiérelo por proximidad a año en el texto."""
+        # Extrae años en el chunk (2022-2026 típico)
+        year_positions = [(m.start(), int(m.group(1))) for m in re.finditer(r"\b(20(?:2[0-9]|19))\b", chunk_text)]
+        if not year_positions:
+            return raw
+        # Para cada triplet métrica sin year, busca el año más cercano antes del valor
+        for item in raw:
+            try:
+                rel = item.get("relation")
+                tgt = item.get("target") or {}
+                if rel not in ("reported_metric", "impacts_revenue"):
+                    continue
+                if tgt.get("year") or tgt.get("fiscal_year"):
+                    continue
+                val = str(tgt.get("value") or "")
+                if not val:
+                    continue
+                # posición del valor en el texto (primer ocurrencia del número sin comas)
+                val_digits = re.sub(r"[^\d]", "", val)[:6]
+                pos = chunk_text.find(val_digits) if val_digits else -1
+                if pos == -1:
+                    # busca por nombre de métrica
+                    pos = chunk_text.lower().find(str(tgt.get("name","")).lower())
+                if pos == -1:
+                    continue
+                # año más cercano antes de pos (dentro de 400 chars)
+                best_year = None
+                best_dist = 10**9
+                for y_pos, y_val in year_positions:
+                    if y_pos < pos:
+                        dist = pos - y_pos
+                        if dist < 400 and dist < best_dist:
+                            best_dist = dist
+                            best_year = y_val
+                if best_year:
+                    tgt["year"] = str(best_year)
+            except Exception:
+                continue
+        return raw
 
     def _parse_triplets(self, raw: List[dict]) -> List[Triplet]:
         triplets: List[Triplet] = []

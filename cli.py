@@ -34,11 +34,28 @@ def build_pipeline(
     )
 
 
-def run_repl(pipeline: FinancialGraphRAGPipeline) -> None:
+def build_agent(pipeline: FinancialGraphRAGPipeline):
+    from src.agent.graph import build_agent_graph
+
+    return build_agent_graph(pipeline)
+
+
+def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True) -> None:
     print("=" * 60)
-    print("Financial GraphRAG - Chat interactivo")
-    print("Escribe una pregunta o /help para ver los comandos.")
+    print("Financial GraphRAG - Chat interactivo (LangGraph determinista single-turn)")
+    print("Escribe una pregunta, 'añade AAPL 2026' para ingesta con confirmación, o /help.")
     print("=" * 60)
+
+    agent = None
+    if use_agent:
+        try:
+            agent = build_agent(pipeline)
+            print("[Agent LangGraph activo: intent classify + HITL ingest_tool]")
+        except Exception as exc:
+            logger.warning("No se pudo inicializar agente, fallback a pipeline directo: %s", exc)
+            agent = None
+
+    import uuid
 
     while True:
         try:
@@ -54,7 +71,7 @@ def run_repl(pipeline: FinancialGraphRAGPipeline) -> None:
             print("Saliendo...")
             break
         if question == "/help":
-            print(HELP_TEXT)
+            print(HELP_TEXT + "\n\nModo agente: escribe 'añade TICKER AÑO' (ej: añade AAPL 2026) para ingesta con confirmación.")
             continue
         if question == "/clear":
             print("\033c", end="")
@@ -82,7 +99,76 @@ def run_repl(pipeline: FinancialGraphRAGPipeline) -> None:
             print(f"Comando desconocido: {question}")
             continue
 
-        print("\nConsultando...\n")
+        # LangGraph agent path con HITL (si disponible y pregunta no es comando)
+        if agent is not None:
+            print("\nConsultando (agent)...\n")
+            try:
+                thread_id = str(uuid.uuid4())
+                config = {"configurable": {"thread_id": thread_id}}
+                # 1º invoke hasta interrupt_before ingest_tool o END
+                result = agent.invoke({"question": question}, config=config)
+                # Si hay interrupt (ingest), result contiene ingest_request pendiente
+                # Detecta si el grafo se pausó
+                state = agent.get_state(config)
+                if state.next and "ingest_tool" in state.next:
+                    vals = state.values
+                    ticker = vals.get("ticker")
+                    year = vals.get("year")
+                    print(f"[Agent] Detectado intento de ingesta: {ticker} / {year}")
+                    print(f"¿Confirmas ingesta de {ticker} {year}? (y/n): ", end="", flush=True)
+                    confirm = input().strip().lower()
+                    if confirm in ("y", "yes", "s", "si"):
+                        print(f"Ingiriendo {ticker}/{year}...")
+                        # reanuda (ejecutará ingest_tool)
+                        result = agent.invoke(None, config=config)
+                        ingest_msg = result.get("ingest_result") or str(result)
+                        print(ingest_msg)
+                        # muestra tool result si es ingest
+                        for m in result.get("messages", [])[-2:]:
+                            if isinstance(m, dict) and m.get("content"):
+                                print(m["content"])
+                            elif hasattr(m, "content"):
+                                print(m.content)
+                    else:
+                        print("Ingesta cancelada, haciendo retrieval en su lugar...")
+                        # cancela ingest y fuerza retrieve: invoca grafo no-interrupt
+                        from src.agent.graph import build_agent_graph_no_interrupt
+
+                        agent2 = build_agent_graph_no_interrupt(pipeline)
+                        # fuerza intent retrieve
+                        result = agent2.invoke({"question": question, "intent": "retrieve", "ticker": None, "year": None}, config={"configurable": {"thread_id": str(uuid.uuid4())}})
+                        answer = result.get("answer", "")
+                        citations = result.get("citations", [])
+                        facts = result.get("graph_facts", [])
+                        metrics = result.get("metrics_rows", [])
+                        print("-" * 60)
+                        print(answer)
+                        print("-" * 60)
+                        print(f"[Facts: {len(facts)} | Metrics: {len(metrics)} | Citations: {len(citations)}]")
+                        if citations:
+                            for c in citations[:5]:
+                                print(f"  - {c}")
+                    continue
+                # No fue ingest → es retrieval
+                answer = result.get("answer", "")
+                citations = result.get("citations", [])
+                facts = result.get("graph_facts", [])
+                metrics = result.get("metrics_rows", [])
+                print("-" * 60)
+                print(answer)
+                print("-" * 60)
+                print(f"[Facts: {len(facts)} | Metrics: {len(metrics)} | Citations: {len(citations)}]")
+                if citations:
+                    print("\nCitas:")
+                    for c in citations[:5]:
+                        print(f"  - {c}")
+                if not answer:
+                    print("\n(No se generó respuesta; revisa los logs.)")
+                continue
+            except Exception as exc:
+                logger.warning("Agent falló, fallback a pipeline: %s", exc)
+
+        print("\nConsultando (pipeline)...\n")
         try:
             result = pipeline.query(question)
         except Exception as exc:
@@ -142,6 +228,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         default=1,
         help="Chunks por llamada LLM en batch (default 1=paralelo fiable con qwen3:8b; 2-3 experimental)",
     )
+    parser.add_argument(
+        "--no-agent",
+        action="store_true",
+        help="Desactiva LangGraph agent y usa pipeline directo",
+    )
     args = parser.parse_args(argv)
 
     load_env()
@@ -159,7 +250,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             pipeline.ingest_companies()
             print("Ingesta completada.")
 
-        run_repl(pipeline)
+        run_repl(pipeline, use_agent=not args.no_agent)
     finally:
         pipeline.close()
 

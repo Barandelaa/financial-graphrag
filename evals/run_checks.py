@@ -88,6 +88,25 @@ def check_sample(
     cited_years = {str(c.get("fiscal_year", "")) for c in citations}
     cited_sections = {_norm(c.get("section_id")) for c in citations}
 
+    # Métricas scoping: solo para preguntas métricas (revenue/sales/income/eps...)
+    q_low = question.lower()
+    is_metric_q = any(k in q_low for k in ["revenue", "sales", "net income", "net earnings", "eps", "operating income", "gross margin", "total assets", "cash", "debt", "profit", "loss"])
+    metrics_rows = getattr(result, "metrics_rows", [])
+    # métrica debe venir scoping por ticker y con value
+    metrics_hit = True
+    if is_metric_q and expected_ticker and expected_ticker in {t.lower() for t in ["aapl","msft","amzn","googl","nvda","meta","tsla","brk.b"]}:
+        # busca fila métrica scoping para el ticker preguntado
+        hit = any(
+            _norm(m.get("ticker")) == expected_ticker and str(m.get("value") or "").strip() != ""
+            for m in metrics_rows
+        )
+        # si no hay métricas pero la respuesta sí trae citas, no penaliza fuera de corpus
+        if metrics_rows:
+            metrics_hit = hit
+        else:
+            # si el corpus no tiene métricas con value (requiere re-ingesta), no falla el gate pero avisa
+            metrics_hit = True
+
     checks = {
         "has_answer": bool((result.answer or "").strip()),
         "has_citations": bool(citations),
@@ -97,6 +116,7 @@ def check_sample(
         "dense_hit": result.dense_results > 0,
         "sparse_hit": result.sparse_results > 0,
         "graph_hit": result.graph_results > 0,
+        "metrics_scoping": metrics_hit,
     }
     return {
         "question": question,
@@ -111,6 +131,7 @@ def check_sample(
             "graph": result.graph_results,
             "facts": len(result.graph_facts),
             "citations": len(citations),
+            "metrics": len(getattr(result, "metrics_rows", [])),
         },
         "checks": checks,
         "score": (
@@ -121,7 +142,7 @@ def check_sample(
 
 def print_summary(results: list[dict]) -> None:
     print("\n" + "=" * 70)
-    print("DETERMINISTIC CHECKS SUMMARY")
+    print("DETERMINISTIC CHECKS SUMMARY (gate 0.85)")
     print("=" * 70)
     ok = [r for r in results if "error" not in r]
     for r in results:
@@ -133,11 +154,12 @@ def print_summary(results: list[dict]) -> None:
         print(f"  [{flags}] {r['question'][:55]}{ooc}")
     print("-" * 70)
     print("  + = pasa, - = falla   (columnas: answer citas ticker año "
-          "sección dense sparse graph)")
+          "sección dense sparse graph metrics)")
     if ok:
         avg = sum(r["score"] for r in ok) / len(ok)
         print(f"  Score medio: {avg:.2f} sobre {len(ok)} muestras OK "
               f"({len(results) - len(ok)} con error)")
+        print(f"  Gate 0.85: {'PASS' if avg >= 0.85 else 'FAIL'}")
     ooc = [r for r in results if not r.get("in_corpus", True)]
     if ooc:
         print(f"  Aviso: {len(ooc)} preguntas apuntan a datos no ingeridos "

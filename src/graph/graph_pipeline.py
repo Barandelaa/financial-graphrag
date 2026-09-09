@@ -185,9 +185,22 @@ def _metric_composite_id(ticker: str, year: int, metric_name: str) -> str:
     return f"{ticker.upper()}_{year}_{slug}"
 
 
+def _metric_year_from_entity(entity: Entity, fallback_year: Optional[int]) -> Optional[int]:
+    for key in ("year", "fiscal_year"):
+        if key in (entity.properties or {}):
+            try:
+                y = int(str(entity.properties[key]).strip()[:4])
+                if 2015 <= y <= 2030:
+                    return y
+            except Exception:
+                pass
+    return fallback_year
+
+
 def _entity_pk_value(entity: Entity, ticker: Optional[str] = None, year: Optional[int] = None) -> Optional[str]:
     """PK normalizada para un Entity, o None si debe descartarse.
     Para FinancialMetric genera id compuesto ticker_year_metric para evitar colisión entre empresas.
+    Usa year de properties si el extractor lo dio (año de la cifra), si no fallback al año del filing.
     """
     raw = (entity.name or "").strip()
     if not raw:
@@ -198,9 +211,11 @@ def _entity_pk_value(entity: Entity, ticker: Optional[str] = None, year: Optiona
             return None
         return norm
     if entity.entity_type == EntityType.financial_metric:
-        # Si tenemos contexto ticker/year, usa PK compuesto
-        if ticker and year:
-            return _metric_composite_id(ticker, year, raw)
+        # Si tenemos contexto ticker/year, usa PK compuesto con año de la métrica si existe
+        if ticker:
+            eff_year = _metric_year_from_entity(entity, year)
+            if eff_year:
+                return _metric_composite_id(ticker, eff_year, raw)
         # Fallback legacy (solo nombre) — para compatibilidad con datos viejos sin contexto
         if len(raw) > 300:
             return None
@@ -547,9 +562,12 @@ class GraphPipeline:
         # Para FinancialMetric el PK es compuesto pero name debe ser el nombre legible
         if entity.entity_type == EntityType.financial_metric:
             props["name"] = (entity.name or "").strip()
-            # Asegura fiscal_year coherente con el chunk
-            if year is not None:
-                props["fiscal_year"] = year
+            # Usa año de la métrica si el extractor lo dio, si no filing year
+            eff_year = _metric_year_from_entity(entity, year)
+            if eff_year is not None:
+                props["fiscal_year"] = eff_year
+            # Limpia year auxiliar, Kuzu espera fiscal_year
+            props.pop("year", None)
             # value/unit ya vienen en props desde el extractor; respeta si existen
         else:
             props["name"] = pk_val
