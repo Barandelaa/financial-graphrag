@@ -1,11 +1,14 @@
 # Financial GraphRAG Engine
 
-Sistema de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (las cuentas que las empresas cotizadas de EE. UU. presentan al regulador). Combina tres formas de recuperar información —**búsqueda vectorial densa, búsqueda léxica BM25 y grafo de conocimiento**— y genera respuestas con **citas a los fragmentos originales**.
+Sistema de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (las cuentas que las empresas cotizadas de EE. UU. presentan al regulador). Combina tres formas de recuperar información —**búsqueda vectorial densa, búsqueda léxica BM25 y grafo de conocimiento**— y genera respuestas con **citas a los fragmentos originales**. Ahora con **agente LangGraph determinista** local (`qwen3:8b`) con **memoria Q/A** y **tabla de métricas scoping** `TICKER_YEAR`.
 
 Ejemplo de lo que responde:
 
 > **¿En qué segmentos opera MSFT?**
 > *Productivity and Business Processes, Intelligent Cloud y More Personal Computing* — con citas a los chunks `Item 7` / `Reportable Segments` y hechos del grafo (`MSFT --OPERATES_IN--> Intelligent Cloud`).
+>
+> **What was AAPL revenue in 2024?**
+> *$391,035 million* — fila `| AAPL | 2024 | total net sales | 391035 USD millions | Item 8 | chunk_id |` scoping `AAPL_2024_total_net_sales`.
 
 ## Cómo funciona
 
@@ -14,7 +17,7 @@ SEC EDGAR 10-K (PDF/HTML)
         │  sec-edgar-downloader
         ▼
 Ingesta: PDF/HTML → Markdown → secciones (Item 1, 1A, 7, 8…)
-        │  chunk ~600 tokens / overlap 90
+        │  chunker table-aware ~600 tokens / overlap 90 (respeta | tablas |)
         ▼
 ┌──────────────┬──────────────┬──────────────────────────┐
 │   LanceDB    │    BM25      │      Kùzu (grafo)        │
@@ -24,27 +27,33 @@ Ingesta: PDF/HTML → Markdown → secciones (Item 1, 1A, 7, 8…)
        │              │                  │
        └──────────────┼──────────────────┘
                       ▼
+        Agente LangGraph determinista single-turn (100% local)
+        classify_intent (with_structured_output) → ingest_tool HITL | retrieve
+        retrieve: expanded query (revenue→net sales) → dense/sparse/graph+metrics_table scoping
         RRF (k=60) → grounding por ticker → dedup
-                      → reranker cross-encoder (bge-reranker-v2-m3)
+                    → reranker cross-encoder (bge-reranker-v2-m3)
+                    → VRAM empty_cache antes de generación
                       ▼
-        LLM + generación con citas + graph facts
-        (segmentos y competidores del grafo)
+        LLM + generación con citas + graph facts + METRICS TABLE
+        (OPERATES_IN/COMPETES_WITH como facts; métricas como tabla | ticker | year | metric | value |)
+        + memoria conversacional Q/A (no chunks, 4 turnos, 500 chars)
 ```
 
-1. **Ingesta** (`src/ingestion/`): descarga el 10-K, lo pasa a Markdown, lo trocea en chunks con metadatos (`ticker`, `año`, `sección`, `página`) y los guarda en `data/processed_chunks/<TICKER>_<AÑO>/chunks.json`.
-2. **Grafo** (`src/graph/`): un LLM extrae tripletas `(origen, relación, destino)` según una ontología fija y se guardan en `triplets.json` como caché. Al persistir en Kùzu se **normalizan tickers** (`Apple→AAPL`, typos OCR `AM,ZN→AMZN`), se **filtran nodos ruidosos** y se indexan menciones `DocumentChunk → entidad` para **origen y destino**.
-3. **Recuperación** (`src/retrieval/`): cada pregunta consulta los tres índices en paralelo, fusiona con RRF, filtra por ticker mencionado, reordena con cross-encoder y genera la respuesta con citas.
-4. **Evaluación** (`evals/`): checks deterministas sobre un dataset de preguntas — respuesta no vacía, citas con ticker/año/sección correctos y cobertura de las tres vías de recuperación. Sin LLM-juez, para que sea estable con modelos locales pequeños.
+1. **Ingesta** (`src/ingestion/`): descarga el 10-K, lo pasa a Markdown (tablas HTML → `| col |`), lo trocea **table-aware** (no parte filas `| | |`) con metadatos (`ticker`, `año`, `sección`, `página`) y lo guarda en `data/processed_chunks/<TICKER>_<AÑO>/chunks.json` (table-aware desde el último rebuild).
+2. **Grafo** (`src/graph/`): LLM (`qwen3:8b` `reasoning=False, format=json, num_ctx 8192`) extrae tripletas `(origen, relación, destino)` con `value/unit/year` para `FinancialMetric` según ontología. PK de métrica es **compuesta** `TICKER_YEAR_slug` (`AAPL_2024_total_net_sales`) con columna `year` inferida por prompt few-shot (`2024 | 2023` → 2 triplets) + fallback regex por proximidad. Se cachea en `triplets.json`, se normalizan tickers (`Apple→AAPL`, `AM,ZN→AMZN`), se filtran ruidos y se persiste en **Kùzu** con `MERGE + seen-set`.
+3. **Recuperación** (`src/retrieval/`): cada pregunta pasa por `expand_query` sinónimos, consulta los tres índices en paralelo + `MetricsTable` scoping (`c.ticker IN $tickers AND m.id CONTAINS '_'`), fusiona con **RRF**, filtra por ticker, dedup, reordena con **cross-encoder** y genera con **citas** (`CHUNK_ID` + `METRICS TABLE` con `section`).
+4. **Agente** (`src/agent/`): `StateGraph` determinista `classify_intent (with_structured_output IntentOutput ingest|retrieve) → parallel_retrieve → fuse_rerank (torch.cuda.empty_cache) → generate`. `ingest_10k(ticker,year)` es el único `Tool` LLM-callable con **HITL** `MemorySaver interrupt_before ingest_tool` y confirmación `y/n` en CLI. Memoria conversacional solo `Q/A` (no chunks, `4×500 chars`).
+5. **Evaluación** (`evals/`): `51 Q/A` (15 viejas fuera de corpus `2023` + 36 nuevas `2024-2025` YoY `revenue/segments/risks`) y checks deterministas `answer, citas, ticker/año/sección, dense/sparse/graph, metrics_scoping` con gate `0.85` (sin LLM-juez local).
 
 ## Estado actual de los datos
 
-Empresas configuradas en `data/companies.json` (años 2024–2025): `AAPL, MSFT, AMZN, GOOGL, NVDA, META, TSLA, BRK.B`.
+Empresas `data/companies.json` `2024–2025`: `AAPL, MSFT, AMZN, GOOGL, NVDA, META, TSLA, BRK.B`.
 
-* ~1.700 chunks y ~11.700 tripletas en caché.
-* Grafo (tras la última reconstrucción desde caché): ~180 compañías (incluye filiales como `BHE`, `Marmon`), ~4.700 métricas, ~1.700 macroeventos, ~1.200 segmentos; `IMPACTS_REVENUE ~2.300`, `REPORTED_METRIC ~4.700`, `MENTIONS_EVENT ~2.000`.
-* Huecos conocidos: `AMZN_2024` sin chunks y `MSFT_2025` sin procesar (ver `reprocess_missing.py`).
+* **Ingesta completa tabla-aware 2026-09-09:** `3067` chunks (`129-292` por filing, antes `1700`), `~19k` tripletas en cache.
+* **Grafo (tras limpieza 5180 viejos):** `7907` `FinancialMetric` (`7837` con `value`, `id` scoping), `Company 216`, `BusinessSegment ~1273`, `216` `COMPETES_WITH`-like; `DocumentChunk 3067`; `REPORTED_METRIC 7923`, `OPERATES_IN ~1380`, `MENTIONS_EVENT ~2038`. `AMZN_2024` y `MSFT_2025` ya sin huecos.
+* **Vector:** `LanceDB 1928→3067 rows`, `BM25` rebuild desde Lance, `bge-m3` + `bge-reranker-v2-m3`.
 
-> **Aviso:** la carpeta `data/` (10-K descargados, chunks, índices LanceDB y grafo Kùzu) **no está en el repositorio** — pesa cientos de MB y está ignorada por git. Al clonar empezarás sin datos y tendrás que ingerir desde cero (`python cli.py --ingest` o `/ingest-all` en el chat), lo que con LLM local puede tardar varias horas (la extracción de tripletas es lo más costoso).
+> **Aviso:** `data/` (`10-K`, `chunks`, `lancedb`, `kuzu_db`) no está en el repo (`.gitignore:12`) y pesa `>500 MB`. Al clonar `python cli.py --ingest --workers 2 --batch-size 1` tarda horas (extracción `workers 2 batch 1` + `reasoning=False` es el path estable para 12GB). `docs/` (`docs/langchain.md` tutorial local) también está ignorado (`.gitignore:33`).
 
 ## Instalación
 
@@ -58,44 +67,49 @@ python -m venv .venv
 # Linux/macOS:
 # source .venv/bin/activate
 
-pip install -r requirements.txt
+pip install -r requirements.txt  # incluye langchain, langgraph
 ```
 
-Configuración del LLM (en `.env` o variables de entorno):
+Configuración LLM (`.env`):
 
 ```bash
 # Opción 1 (por defecto): Ollama local
-ollama pull qwen3:8b        # DEFAULT_OLLAMA_MODEL = "qwen3:8b"
+ollama pull qwen3:8b        # DEFAULT_OLLAMA_MODEL = "qwen3:8b" (reasoning=False, format=json, num_ctx 8192)
+# Para 12GB: OLLAMA_NUM_PARALLEL=2
 
-# Opción 2 (fallback automático si Ollama no responde): Groq
-export GROQ_API_KEY="gsk_..."   # DEFAULT_GROQ_MODEL = "mixtral-8x7b-32768"
-
-# Opcional: token de HuggingFace para embeddings bge-m3
+# Opción 2 fallback si Ollama no responde: Groq
+export GROQ_API_KEY="gsk_..."
+# Opcional HF_TOKEN para bge-m3
 export HF_TOKEN="hf_..."
 ```
 
-> `create_llm()` usa Ollama si está disponible y cae a Groq si no. Sin ninguno de los dos, la ingesta/extracción y la generación no funcionan (la búsqueda densa/BM25/grafo sí, una vez indexado).
+> `create_llm()` usa Ollama y cae a Groq. Generación/extracción requieren LLM; `dense/BM25/grafo` funcionan con índice ya construido.
 
 ## Uso
 
-### Chat interactivo (CLI)
+### Chat interactivo (CLI con agente)
 
 ```bash
-python cli.py
-python cli.py --ticker AAPL --year 2024   # ingiere al arrancar
-python cli.py --ingest                    # ingiere todo data/companies.json
+python cli.py                          # agente LangGraph determinista + memoria Q/A
+python cli.py --no-agent               # pipeline directo sin agente
+python cli.py --workers 2 --batch-size 1  # estable 12GB (default 4→2)
+python cli.py --ticker AAPL --year 2024
+python cli.py --ingest
 ```
 
 Dentro del chat:
 
 ```
-<pregunta>             -> consulta al pipeline RAG
-/ingest <ticker> <año> -> ingiere e indexa un 10-K (ej: /ingest AAPL 2024)
-/ingest-all            -> ingiere todas las empresas de data/companies.json
-/clear, /help, /exit
+<pregunta>             -> retrieval RAG (ej: What was AAPL revenue in 2024?)
+¿y en 2023?            -> follow-up usa memoria (history_ticker AAPL)
+añade AAPL 2026        -> clasifica ingest → ¿Confirmas ingesta AAPL 2026? (y/n) → HITL Tool
+/ingest <ticker> <año> -> ingesta directa sin agente
+/ingest-all            -> data/companies.json
+/clear                 -> limpia memoria conversacional (nuevo thread_id)
+/help, /exit
 ```
 
-Cada respuesta muestra `[Dense | Sparse | Graph | Facts]`, las citas (`chunk_id`, `ticker`, `año`, `sección`, `score`) y los hechos del grafo usados.
+Cada respuesta muestra `[Facts: N | Metrics: N | Citations: N]` (truncado a 5), citas `chunk_id/ticker/año/sección/score` y `METRICS TABLE` scoping si aplica.
 
 ### Desde Python
 
@@ -103,94 +117,108 @@ Cada respuesta muestra `[Dense | Sparse | Graph | Facts]`, las citas (`chunk_id`
 from src.llm_factory import create_llm
 from src.pipeline import FinancialGraphRAGPipeline
 
-llm = create_llm()
-pipeline = FinancialGraphRAGPipeline(llm=llm)
-
-pipeline.ingest_and_index(ticker="AAPL", year=2024)  # usa caché si existe
+llm = create_llm()  # reasoning=False
+pipeline = FinancialGraphRAGPipeline(llm=llm, graph_max_workers=2, graph_batch_size=1)
+pipeline.ingest_and_index(ticker="AAPL", year=2024)  # use_cache=False para re-extraer con year
 result = pipeline.query("Which segments does MSFT operate in?")
 print(result.answer)
 print(result.citations)
-print(result.graph_facts)
+print(result.metrics_rows)  # scoping
 pipeline.close()
+
+# Agente directo
+from src.agent.graph import build_agent_graph
+agent = build_agent_graph(pipeline)
+agent.invoke({"question": "What was AAPL revenue in 2024?"}, config={"configurable":{"thread_id":"t1"}})
 ```
 
 ### Reprocesar huecos
 
 ```bash
-python reprocess_missing.py   # detecta pares sin triplets.json y los procesa
+python reprocess_missing.py --workers 2 --batch-size 1
+# detecta triplets parciales (cached_ids < len(chunks)) y fuerza re-ingesta si chunks vacío (AMZN_2024)
 ```
 
 ### Evaluación y tests
 
 ```bash
-python evals/run_checks.py             # checks: respuesta, citas, ticker/año/sección, dense/sparse/graph
-python evals/run_checks.py --samples 3 # limita a las 3 primeras preguntas
-python -m pytest tests/ -v             # requiere pytest (no incluido en requirements)
+python evals/run_checks.py --samples 5            # gate 0.85, 9 checks (+metrics_scoping)
+python evals/run_checks.py                         # 51 Q/A (~6 min con qwen3:8b)
+& ".\.venv\Scripts\python.exe" evals/run_checks.py # en Windows con .venv
+# pytest opcional (no en requirements por defecto)
+pip install pytest && python -m pytest tests/ -v
 ```
 
 ## Estructura del repositorio
 
 ```
 financial-graphrag/
-├── cli.py                      # Chat REPL (/ingest, /ingest-all, consultas)
-├── reprocess_missing.py        # Reprocesa pares ticker/año sin triplets.json
-├── data/                       # Generado, ignorado por git
-│   ├── raw_10k/                # PDFs/HTML de SEC EDGAR
-│   ├── processed_chunks/       # chunks.json + triplets.json por <TICKER>_<AÑO>
-│   ├── vector_store/lancedb/   # Índice denso embebido
-│   └── graph/kuzu_db/          # Grafo Kùzu embebido
+├── cli.py                      # REPL agente LangGraph (HITL + memoria Q/A) + /ingest
+├── reprocess_missing.py        # Detecta faltantes/parciales y ingesta con workers/batch
+├── docs/                       # Tutorial local LangChain (ignorado git)
+├── data/                       # Generado, ignorado
+│   ├── raw_10k/                # full-submission.txt + .download_cache.json
+│   ├── processed_chunks/       # chunks.json + triplets.json (PK TICKER_YEAR_metric)
+│   ├── vector_store/lancedb/   # LanceDB bge-m3
+│   └── graph/kuzu_db/          # Kuzu
 ├── src/
-│   ├── env.py                  # Carga .env (HF_TOKEN, GROQ_API_KEY)
-│   ├── llm_factory.py          # Ollama (qwen3:8b) con fallback a Groq
-│   ├── pipeline.py             # FinancialGraphRAGPipeline end-to-end
-│   ├── ingestion/              # downloader, parser, chunker, pipeline
-│   ├── graph/                  # schema, extractor, graph_pipeline, communities
-│   └── retrieval/              # dense, sparse, graph_traversal, graph_facts,
-│                               # rrf, reranker, generator, pipeline
-├── evals/                      # test_dataset.json + checks deterministas
-└── tests/                      # unitarios (reranker) + integración (pipeline)
+│   ├── agent/                  # LangGraph determinista single-turn
+│   │   ├── state.py            # AgentState (messages Q/A, no chunks)
+│   │   ├── tools.py            # ingest_10k Tool
+│   │   ├── nodes.py            # classify_intent with_structured_output + parallel_retrieve + fuse_rerank + generate + history
+│   │   └── graph.py            # StateGraph + MemorySaver interrupt_before ingest_tool
+│   ├── env.py
+│   ├── llm_factory.py          # ChatOllama qwen3:8b reasoning=False format=json
+│   ├── pipeline.py             # FinancialGraphRAGPipeline
+│   ├── ingestion/              # downloader, parser (HTML tables → | |), chunker table-aware, pipeline
+│   ├── graph/                  # schema, extractor (value/unit/year), graph_pipeline (PK compuesto), communities
+│   └── retrieval/              # dense, sparse, graph_traversal, graph_facts, metrics_table scoping, rrf, reranker, generator, pipeline (query expansion)
+├── evals/
+│   ├── test_dataset.json       # 51 Q/A (2024-2025 YoY)
+│   └── run_checks.py           # 9 checks + gate 0.85 + metrics scoping
+└── tests/
 ```
 
 ## Ontología del grafo
 
 | Nodo | Clave | Descripción |
 |---|---|---|
-| `Company` | `ticker` | Empresa (ticker canónico: `AAPL`, `BRK.B`…) |
-| `FinancialMetric` | `id` | Métrica numérica (revenue, EPS, total assets…) |
-| `RiskFactor` | `id` | Riesgo divulgado en el 10-K |
-| `BusinessSegment` | `id` | Segmento operativo/reportable |
-| `MacroEvent` | `id` | Evento macroeconómico o geopolítico |
-| `DocumentChunk` | `chunk_id` | Fragmento con `ticker`, `año`, `sección`, `página` |
+| `Company` | `ticker` | `AAPL, BRK.B` canónico |
+| `FinancialMetric` | `id = TICKER_YEAR_slug` | Métrica scoping `AAPL_2024_total_net_sales` con `value/unit/fiscal_year` |
+| `RiskFactor` | `id` | Riesgo Item 1A |
+| `BusinessSegment` | `id` | Segmento reportable |
+| `MacroEvent` | `id` | Evento macro |
+| `DocumentChunk` | `chunk_id` | `ticker/año/sección/página` |
 
 | Relación | Origen → Destino |
 |---|---|
 | `OPERATES_IN` | Company → BusinessSegment |
-| `REPORTED_METRIC` | Company → FinancialMetric |
+| `REPORTED_METRIC` | Company → FinancialMetric (scoping) |
 | `IMPACTS_REVENUE` | MacroEvent → FinancialMetric |
 | `MITIGATES_RISK` | BusinessSegment → RiskFactor |
 | `COMPETES_WITH` | Company → Company |
-| `MENTIONS_*` | DocumentChunk → cada tipo de entidad |
+| `MENTIONS_*` | DocumentChunk → entidad |
 
-Notas de diseño:
+Notas:
 
-* Los valores numéricos de `FinancialMetric` **no** se exponen como hechos al generador (una métrica comparte nombre entre empresas y el valor sería ambiguo); solo se exponen `OPERATES_IN` y `COMPETES_WITH` como `graph facts`. Los números llegan al LLM vía los chunks citados.
-* La persistencia deduplica (MERGE + `seen-set` por chunk), normaliza compañías y descarta ruido (nombres vacíos, genéricos como `Services`/`other companies`, tickers colados en otras tablas).
+* `FinancialMetric` ya no colisiona (`revenue` → `AAPL_2024_revenue` vs `MSFT_2024_revenue`) y tablas `2024|2023` generan 2 triplets con `year` por columna (prompt few-shot + fallback regex). `GENERATION` usa `METRICS TABLE scoping` no `graph_facts` para cifras.
+* `chunker` respeta `| tablas |` y `parser` convierte `HTML <table>` a `| col |`.
 
 ## Stack
 
 | Componente | Tecnología |
 |---|---|
 | Lenguaje | Python 3.10+ |
-| Ingesta | sec-edgar-downloader, pdfplumber, markdownify, unstructured |
+| Ingesta | sec-edgar-downloader, pdfplumber, markdownify, unstructured, bs4 |
 | Embeddings | BAAI/bge-m3 (sentence-transformers) |
-| Vector store | LanceDB (embebido) |
+| Vector store | LanceDB |
 | Léxico | BM25 (rank-bm25) |
-| Grafo | Kùzu (embebido) |
-| LLM | Ollama `qwen3:8b` por defecto · Groq `mixtral-8x7b-32768` como fallback |
-| Framework | LangChain / langchain-core |
-| Reranker | BAAI/bge-reranker-v2-m3 (cross-encoder) |
-| Comunidades | Leiden (leidenalg + igraph + networkx) |
-| Evaluación | Checks deterministas (`evals/run_checks.py`) |
+| Grafo | Kùzu (MERGE scoping) |
+| LLM | Ollama `qwen3:8b` `reasoning=False, format=json, num_ctx 8192` → Groq fallback |
+| Framework | LangChain / LangGraph (StateGraph determinista, ToolNode HITL) |
+| Reranker | BAAI/bge-reranker-v2-m3 |
+| Comunidades | Leiden + igraph + networkx |
+| Evaluación | Checks deterministas gate 0.85 + metrics_scoping (`evals/run_checks.py`) |
 
 ## Licencia
 
