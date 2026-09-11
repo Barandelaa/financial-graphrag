@@ -78,6 +78,18 @@ _VALID_TICKERS = frozenset(
     {"AAPL", "MSFT", "AMZN", "GOOGL", "NVDA", "META", "TSLA", "BRK.B"}
 )
 
+
+def _known_tickers() -> set[str]:
+    """Tickers base + dados de alta en companies.json (dinámico, sin curado)."""
+    tickers = set(_VALID_TICKERS)
+    try:
+        from src.agent.company_registry import get_config_tickers
+
+        tickers |= {t.upper() for t in get_config_tickers()}
+    except Exception:
+        pass
+    return tickers
+
 # Nombres genéricos que el extractor cuela como Company y deben descartarse.
 _NOISY_COMPANY_EXACT = frozenset(
     {
@@ -147,7 +159,7 @@ def _normalize_company_name(raw: str) -> Optional[str]:
     if alias:
         return alias
     upper = s.upper()
-    if upper in _VALID_TICKERS:
+    if upper in _known_tickers():
         return upper
     # Variantes con sufijos legales: 'Amazon, Inc.' -> 'AMZN', 'Microsoft
     # Corporation, or Microsoft' -> 'MSFT'. Substring insensible a puntuación.
@@ -222,7 +234,7 @@ def _entity_pk_value(entity: Entity, ticker: Optional[str] = None, year: Optiona
         return raw
     # Tickers/alias colados en otras tablas (p.ej. MacroEvent 'AAPL' o
     # BusinessSegment 'Apple') se descartan: pertenecen a Company.
-    if _normalize_company_name(raw) in _VALID_TICKERS:
+    if _normalize_company_name(raw) in _known_tickers():
         return None
     # Resto de tipos: recorta y descarta vacíos o absurdamente largos.
     if len(raw) > 300:

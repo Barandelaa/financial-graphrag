@@ -1,6 +1,6 @@
 # Financial GraphRAG Engine
 
-Sistema de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (las cuentas que las empresas cotizadas de EE. UU. presentan al regulador). Combina tres formas de recuperar información —**búsqueda vectorial densa, búsqueda léxica BM25 y grafo de conocimiento**— y genera respuestas con **citas a los fragmentos originales**. Ahora con **agente LangGraph determinista** local (`qwen3:8b`) con **memoria Q/A** y **tabla de métricas scoping** `TICKER_YEAR`.
+Sistema de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (las cuentas que las empresas cotizadas de EE. UU. presentan al regulador). Combina tres formas de recuperar información —**búsqueda vectorial densa, búsqueda léxica BM25 y grafo de conocimiento**— y genera respuestas con **citas a los fragmentos originales**. Con **dos agentes LangGraph** locales (`qwen3:8b`): determinista con **memoria Q/A** y **ReAct** con tools (`query_financial_rag`, `lookup_metrics`, `financial_calculator`, alta de empresas vía universo SEC), más **tabla de métricas scoping** `TICKER_YEAR`.
 
 Ejemplo de lo que responde:
 
@@ -27,8 +27,11 @@ Ingesta: PDF/HTML → Markdown → secciones (Item 1, 1A, 7, 8…)
        │              │                  │
        └──────────────┼──────────────────┘
                       ▼
-        Agente LangGraph determinista single-turn (100% local)
-        classify_intent (with_structured_output) → ingest_tool HITL | retrieve
+        Dos modos de agente (100% local, memoria Q/A: no chunks, 4 turnos, 500 chars):
+        A) Determinista: classify_intent (with_structured_output) → ingest_tool HITL | retrieve
+        B) ReAct (--react): el modelo decide tools (create_react_agent + MemorySaver)
+           tools: query_financial_rag | lookup_metrics | financial_calculator
+                  propose_new_company | add_company_to_config (HITL 1) | ingest_10k (HITL 2)
         retrieve: expanded query (revenue→net sales) → dense/sparse/graph+metrics_table scoping
         RRF (k=60) → grounding por ticker → dedup
                     → reranker cross-encoder (bge-reranker-v2-m3)
@@ -36,13 +39,17 @@ Ingesta: PDF/HTML → Markdown → secciones (Item 1, 1A, 7, 8…)
                       ▼
         LLM + generación con citas + graph facts + METRICS TABLE
         (OPERATES_IN/COMPETES_WITH como facts; métricas como tabla | ticker | year | metric | value |)
-        + memoria conversacional Q/A (no chunks, 4 turnos, 500 chars)
+        Alta de empresas: universo oficial SEC (company_tickers.json) + verificación 10-K en EDGAR,
+        sin mapas curados; ticker literal exacto → vía rápida, resto → pregunta al usuario
 ```
 
 1. **Ingesta** (`src/ingestion/`): descarga el 10-K, lo pasa a Markdown (tablas HTML → `| col |`), lo trocea **table-aware** (no parte filas `| | |`) con metadatos (`ticker`, `año`, `sección`, `página`) y lo guarda en `data/processed_chunks/<TICKER>_<AÑO>/chunks.json` (table-aware desde el último rebuild).
 2. **Grafo** (`src/graph/`): LLM (`qwen3:8b` `reasoning=False, format=json, num_ctx 8192`) extrae tripletas `(origen, relación, destino)` con `value/unit/year` para `FinancialMetric` según ontología. PK de métrica es **compuesta** `TICKER_YEAR_slug` (`AAPL_2024_total_net_sales`) con columna `year` inferida por prompt few-shot (`2024 | 2023` → 2 triplets) + fallback regex por proximidad. Se cachea en `triplets.json`, se normalizan tickers (`Apple→AAPL`, `AM,ZN→AMZN`), se filtran ruidos y se persiste en **Kùzu** con `MERGE + seen-set`.
 3. **Recuperación** (`src/retrieval/`): cada pregunta pasa por `expand_query` sinónimos, consulta los tres índices en paralelo + `MetricsTable` scoping (`c.ticker IN $tickers AND m.id CONTAINS '_'`), fusiona con **RRF**, filtra por ticker, dedup, reordena con **cross-encoder** y genera con **citas** (`CHUNK_ID` + `METRICS TABLE` con `section`).
-4. **Agente** (`src/agent/`): `StateGraph` determinista `classify_intent (with_structured_output IntentOutput ingest|retrieve) → parallel_retrieve → fuse_rerank (torch.cuda.empty_cache) → generate`. `ingest_10k(ticker,year)` es el único `Tool` LLM-callable con **HITL** `MemorySaver interrupt_before ingest_tool` y confirmación `y/n` en CLI. Memoria conversacional solo `Q/A` (no chunks, `4×500 chars`).
+4. **Agentes** (`src/agent/`):
+   - **Determinista**: `StateGraph` `classify_intent (with_structured_output IntentOutput ingest|retrieve) → parallel_retrieve → fuse_rerank (torch.cuda.empty_cache) → generate`. `ingest_10k(ticker,year)` con **HITL** `MemorySaver interrupt_before ingest_tool` y confirmación `y/n` en CLI. Memoria conversacional solo `Q/A` (no chunks, `4×500 chars`).
+   - **ReAct** (`--react`, `react_graph.py`, system prompt en inglés para `qwen3:8b`): `create_react_agent` con 6 tools — `query_financial_rag` (retrieval completo), `lookup_metrics` (cifras scoping), `financial_calculator` (`yoy_pct|pct_change|diff|ratio|sum|avg`, siempre con cifras de tools y mostrando `FORMULA`), `propose_new_company` (solo lectura: universo SEC + verificación 10-K en EDGAR), `add_company_to_config` (**HITL 1**: editar `companies.json` con backup `.bak`) e `ingest_10k` (**HITL 2**: ingesta). El LLM para ReAct se crea con `create_llm(json_mode=False)` para `tool_calls` nativos (el determinista/extractor usan `format=json`).
+   - **Alta de empresas** (`company_registry.py`, sin mapas curados): universo oficial SEC cacheado (`data/sec/company_tickers.json`, TTL 30 días) + difusa `difflib`; ticker literal exacto → vía rápida sin pregunta; resto → candidatos y pregunta obligatoria al usuario antes de buscar documentos; índices/filiales sin 10-K se explican y no se dan de alta. Las listas de tickers de ingesta/retrieval/grafo se construyen desde `companies.json` + universo SEC.
 5. **Evaluación** (`evals/`): `51 Q/A` (15 viejas fuera de corpus `2023` + 36 nuevas `2024-2025` YoY `revenue/segments/risks`) y checks deterministas `answer, citas, ticker/año/sección, dense/sparse/graph, metrics_scoping` con gate `0.85` (sin LLM-juez local).
 
 ## Estado actual de los datos
@@ -91,6 +98,7 @@ export HF_TOKEN="hf_..."
 
 ```bash
 python cli.py                          # agente LangGraph determinista + memoria Q/A
+python cli.py --react                  # agente ReAct (el modelo decide tools) + doble HITL
 python cli.py --no-agent               # pipeline directo sin agente
 python cli.py --workers 2 --batch-size 1  # estable 12GB (default 4→2)
 python cli.py --ticker AAPL --year 2024
@@ -103,11 +111,14 @@ Dentro del chat:
 <pregunta>             -> retrieval RAG (ej: What was AAPL revenue in 2024?)
 ¿y en 2023?            -> follow-up usa memoria (history_ticker AAPL)
 añade AAPL 2026        -> clasifica ingest → ¿Confirmas ingesta AAPL 2026? (y/n) → HITL Tool
+I want to know about nasdaq / Fluence Energy  -> (modo --react) propone alta vía SEC → ¿Confirmas editar companies.json? (y/n) → ¿Confirmas ingesta? (y/n)
 /ingest <ticker> <año> -> ingesta directa sin agente
 /ingest-all            -> data/companies.json
 /clear                 -> limpia memoria conversacional (nuevo thread_id)
 /help, /exit
 ```
+
+La ingesta del agente usa los mismos `workers/batch` del arranque (van con el pipeline, no son propios del agente). El alta escribe `companies.json` dejando backup `companies.json.bak`.
 
 Cada respuesta muestra `[Facts: N | Metrics: N | Citations: N]` (truncado a 5), citas `chunk_id/ticker/año/sección/score` y `METRICS TABLE` scoping si aplica.
 
@@ -130,6 +141,13 @@ pipeline.close()
 from src.agent.graph import build_agent_graph
 agent = build_agent_graph(pipeline)
 agent.invoke({"question": "What was AAPL revenue in 2024?"}, config={"configurable":{"thread_id":"t1"}})
+
+# Agente ReAct (tools + doble HITL)
+from src.agent.react_graph import build_react_agent
+from langchain_core.messages import HumanMessage
+react = build_react_agent(pipeline)  # usa create_llm(json_mode=False) para tool_calls
+react.invoke({"messages": [HumanMessage(content="YoY de AAPL revenue 2024 vs 2023")]},
+             config={"configurable": {"thread_id": "t2"}})
 ```
 
 ### Reprocesar huecos
@@ -162,13 +180,15 @@ financial-graphrag/
 │   ├── vector_store/lancedb/   # LanceDB bge-m3
 │   └── graph/kuzu_db/          # Kuzu
 ├── src/
-│   ├── agent/                  # LangGraph determinista single-turn
+│   ├── agent/                  # Determinista + ReAct (100% local)
 │   │   ├── state.py            # AgentState (messages Q/A, no chunks)
-│   │   ├── tools.py            # ingest_10k Tool
+│   │   ├── tools.py            # ingest_10k + query_financial_rag + lookup_metrics + financial_calculator + propose_new_company + add_company_to_config
+│   │   ├── company_registry.py # Universo oficial SEC + resolve difuso + verify_10k EDGAR + add_company (.bak)
 │   │   ├── nodes.py            # classify_intent with_structured_output + parallel_retrieve + fuse_rerank + generate + history
-│   │   └── graph.py            # StateGraph + MemorySaver interrupt_before ingest_tool
+│   │   ├── graph.py            # StateGraph determinista + MemorySaver interrupt_before ingest_tool
+│   │   └── react_graph.py      # create_react_agent (prompt EN) + MemorySaver interrupt_before tools
 │   ├── env.py
-│   ├── llm_factory.py          # ChatOllama qwen3:8b reasoning=False format=json
+│   ├── llm_factory.py          # ChatOllama qwen3:8b reasoning=False (json_mode=True → format=json; False → tool_calls nativos)
 │   ├── pipeline.py             # FinancialGraphRAGPipeline
 │   ├── ingestion/              # downloader, parser (HTML tables → | |), chunker table-aware, pipeline
 │   ├── graph/                  # schema, extractor (value/unit/year), graph_pipeline (PK compuesto), communities
@@ -214,8 +234,8 @@ Notas:
 | Vector store | LanceDB |
 | Léxico | BM25 (rank-bm25) |
 | Grafo | Kùzu (MERGE scoping) |
-| LLM | Ollama `qwen3:8b` `reasoning=False, format=json, num_ctx 8192` → Groq fallback |
-| Framework | LangChain / LangGraph (StateGraph determinista, ToolNode HITL) |
+| LLM | Ollama `qwen3:8b` `reasoning=False, num_ctx 8192` (`format=json` en determinista/extractor; `tool_calls` nativos en ReAct) → Groq fallback |
+| Framework | LangChain / LangGraph (StateGraph determinista + ReAct `create_react_agent`, ToolNode HITL) |
 | Reranker | BAAI/bge-reranker-v2-m3 |
 | Comunidades | Leiden + igraph + networkx |
 | Evaluación | Checks deterministas gate 0.85 + metrics_scoping (`evals/run_checks.py`) |

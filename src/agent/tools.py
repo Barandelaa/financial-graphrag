@@ -14,15 +14,25 @@ _VALID_TICKERS = frozenset({"AAPL", "MSFT", "AMZN", "GOOGL", "NVDA", "META", "TS
 _TICKER_RE = re.compile(r"\b(AAPL|MSFT|AMZN|GOOGL|NVDA|META|TSLA|BRK\.B)\b", re.IGNORECASE)
 
 
+def _allowed_tickers() -> set[str]:
+    """Tickers base + los dados de alta en companies.json (sin listas curadas nuevas)."""
+    from src.agent.company_registry import get_config_tickers
+
+    return set(_VALID_TICKERS) | {t.upper() for t in get_config_tickers()}
+
+
 def _make_ingest_tool(pipeline: FinancialGraphRAGPipeline):
     @tool
     def ingest_10k(ticker: str, year: int, use_cache: bool = False) -> str:
-        """Ingest SEC 10-K para ticker/año y indexa en grafo+vector. ticker: AAPL|MSFT|AMZN|GOOGL|NVDA|META|TSLA|BRK.B, year: 2020-2026."""
-        t = ticker.strip().upper()
-        if t == "BRKB":
-            t = "BRK.B"
-        if t not in _VALID_TICKERS:
-            return f"Error: ticker '{t}' no soportado. Soportados: {', '.join(sorted(_VALID_TICKERS))}"
+        """Ingiere el 10-K de la SEC para un ticker y año y lo indexa en grafo+vector. Usar SOLO cuando el usuario pide explícitamente añadir/ingerir un ticker/año nuevo (ej: 'añade AAPL 2026') y TRAS confirmación. ticker: cualquiera dado de alta en companies.json, year: 2020-2026."""
+        from src.agent.company_registry import _ticker_key
+
+        allowed = _allowed_tickers()
+        by_key = {_ticker_key(t): t for t in allowed}
+        key = _ticker_key(ticker)
+        if key not in by_key:
+            return f"Error: ticker '{ticker}' no está dado de alta. Usa propose_new_company primero."
+        t = by_key[key]
         try:
             y = int(year)
         except Exception:
@@ -39,12 +49,166 @@ def _make_ingest_tool(pipeline: FinancialGraphRAGPipeline):
     return ingest_10k
 
 
+def make_react_tools(pipeline: FinancialGraphRAGPipeline):
+    """Tools base para el agente ReAct. Lista extensible: añade aquí futuras tools."""
+    from langchain_core.tools import tool as _tool
+
+    ingest_tool = _make_ingest_tool(pipeline)
+    rp = pipeline.retrieval
+
+    @_tool
+    def query_financial_rag(question: str) -> str:
+        """Busca en los 10-K indexados (dense BM25 grafo + rerank) y genera respuesta con citas. Úsala para CUALQUIER pregunta financiera sobre tickers/años/segmentos/métricas/riesgos. Devuelve answer + citas + metrics."""
+        try:
+            result = pipeline.query(question)
+            lines = [f"ANSWER: {result.answer}", ""]
+            if result.graph_facts:
+                lines.append("GRAPH FACTS:")
+                lines.extend(f"- {f}" for f in result.graph_facts[:20])
+                lines.append("")
+            metrics = getattr(result, "metrics_rows", [])
+            if metrics:
+                lines.append("METRICS TABLE (| ticker | year | metric | value |):")
+                for m in metrics[:20]:
+                    lines.append(f"| {m.get('ticker')} | {m.get('year')} | {m.get('metric')} | {m.get('value')} {m.get('unit','') or ''} | {m.get('metric_id')} | {m.get('chunk_id','')} |")
+                lines.append("")
+            if result.citations:
+                lines.append("CITATIONS:")
+                for c in result.citations[:5]:
+                    lines.append(f"- {c.get('company_ticker')} | {c.get('fiscal_year')} | {c.get('section_id')} | chunk {c.get('chunk_id')}")
+            # VRAM: cede a Ollama tras rerank/embeddings
+            try:
+                import gc as _gc
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                _gc.collect()
+            except Exception:
+                pass
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.exception("query_financial_rag failed: %s", exc)
+            return f"Error en retrieval: {exc}"
+
+    @_tool
+    def lookup_metrics(ticker: str, year: int = 0, metric_hint: str = "") -> str:
+        """Tabla de métricas scoping TICKER_YEAR (ej: AAPL_2024_total_net_sales). Úsala para cifras exactas revenue/net income/EPS. ticker requerido, year 0=todos, metric_hint filtra por nombre."""
+        try:
+            q = f"{ticker} {metric_hint or 'revenue net income EPS'} {year if year else ''}".strip()
+            rows = rp.metrics_retriever.search(q)
+            if year:
+                rows = [r for r in rows if r.year == int(year)]
+            if metric_hint:
+                mh = metric_hint.lower()
+                rows = [r for r in rows if mh in r.metric.lower() or any(w in r.metric.lower() for w in mh.split())]
+            if not rows:
+                return f"Sin métricas scoping para {ticker} {year or ''} '{metric_hint}'. Prueba query_financial_rag con la pregunta completa."
+            out = [rp.metrics_retriever.format_as_block(rows[:20])]
+            return "\n".join(out)
+        except Exception as exc:
+            return f"Error lookup_metrics: {exc}"
+
+    @_tool
+    def financial_calculator(operation: str, a: str, b: str = "") -> str:
+        """Calculadora determinista para YoY y comparativas. FLUJO OBLIGATORIO: PRIMERO obtén 'a' y 'b' con query_financial_rag o lookup_metrics (misma unidad), LUEGO llama aquí. NUNCA calcules con cifras de memoria. operation: 'yoy_pct'|'pct_change' (a=current,b=previous), 'diff' (a-b), 'ratio' (a/b), 'sum', 'avg'. Acepta '$391,035', '383285', '12.5B'."""
+        import re as _re
+
+        def _parse(raw: str) -> tuple[float, str]:
+            s = (raw or "").strip().replace(",", "").replace("$", "").replace("%", "").strip()
+            m = _re.match(r"^([+-]?\d+(?:\.\d+)?)\s*([bmk]|billion|million|thousand)?s?$", s, _re.IGNORECASE)
+            if not m:
+                # último intento: primer número dentro del texto
+                m2 = _re.search(r"[+-]?\d+(?:\.\d+)?", s)
+                if not m2:
+                    raise ValueError(f"no es un número: {raw!r}")
+                return float(m2.group(0)), ""
+            num = float(m.group(1))
+            suf = (m.group(2) or "").lower()
+            mult = {"b": 1e9, "billion": 1e9, "m": 1e6, "million": 1e6, "k": 1e3, "thousand": 1e3}.get(suf, 1.0)
+            return num * mult, suf
+
+        try:
+            op = (operation or "").strip().lower()
+            if op not in ("yoy_pct", "pct_change", "diff", "ratio", "sum", "avg"):
+                return f"Error: operation '{operation}' no válida. Usa: yoy_pct|pct_change|diff|ratio|sum|avg."
+            av, _ = _parse(a)
+            if op in ("yoy_pct", "pct_change", "diff", "ratio") and not (b or "").strip():
+                return f"Error: operation '{op}' necesita 'b' (valor previo/base). Primero recupéralo con lookup_metrics."
+            bv, _ = _parse(b) if (b or "").strip() else (0.0, "")
+            if op in ("yoy_pct", "pct_change"):
+                if bv == 0:
+                    return "Error: división por cero (b=0)."
+                pct = (av - bv) / abs(bv) * 100
+                return f"FORMULA: ({av:g} - {bv:g}) / {bv:g} * 100 = {pct:.2f}%"
+            if op == "diff":
+                return f"FORMULA: {av:g} - {bv:g} = {av - bv:g}"
+            if op == "ratio":
+                if bv == 0:
+                    return "Error: división por cero (b=0)."
+                return f"FORMULA: {av:g} / {bv:g} = {av / bv:.4f}"
+            if op == "sum":
+                return f"FORMULA: {av:g} + {bv:g} = {av + bv:g}"
+            # avg
+            return f"FORMULA: ({av:g} + {bv:g}) / 2 = {(av + bv) / 2:g}"
+        except Exception as exc:
+            return f"Error financial_calculator: {exc}"
+
+    @_tool
+    def propose_new_company(user_text: str) -> str:
+        """Propone el alta de una empresa nueva: resuelve texto libre contra el universo oficial SEC y verifica 10-K en EDGAR. SOLO LECTURA, no escribe nada. Si la coincidencia es exacta de ticker la propone directa; si no, devuelve candidatos para PREGUNTAR al usuario antes de buscar documentos."""
+        try:
+            from src.agent.company_registry import get_config_tickers, resolve_company, verify_10k
+
+            res = resolve_company(user_text)
+            if res.get("exact"):
+                t = res["ticker"]
+                if t in get_config_tickers():
+                    return f"EXACTA: {t} ({res['name']}) ya está dada de alta en companies.json. Usa ingest_10k si falta algún año."
+                v = verify_10k(res["cik"], t)
+                if v.get("ok"):
+                    return f"EXACTA: {t} ({res['name']}, CIK {res['cik']}) con 10-K recientes {v.get('recent_10k')}. Pide confirmación 1 para añadir a companies.json."
+                return f"EXACTA pero SIN 10-K: {t} ({res['name']}): {v.get('reason')} No propongas alta."
+            cands = res.get("candidates", [])
+            if not cands:
+                return f"Sin candidatos en el universo SEC para {user_text!r}. Pide al usuario el ticker exacto (ej: DOW) o aclara si es un índice (sin 10-K)."
+            lines = [f"Candidatos SEC para {user_text!r} — PREGUNTA al usuario cuál es antes de buscar documentos:"]
+            for c in cands:
+                lines.append(f"- {c['ticker']} ({c['name']}) score={c['score']}")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Error propose_new_company: {exc}"
+
+    @_tool
+    def add_company_to_config(ticker: str) -> str:
+        """Añade un ticker YA CONFIRMADO por el usuario a data/companies.json (con backup .bak). Usar SOLO tras confirmación 1 explícita. No ingiere nada; la ingesta va después con ingest_10k tras confirmación 2."""
+        try:
+            from src.agent.company_registry import add_company, get_config_years, record_resolution
+
+            out = add_company(ticker)
+            record_resolution(ticker, out["ticker"])
+            return f"OK: {out['ticker']} dado de alta. companies: {out['before']} -> {out['after']}. Años: {get_config_years()}. Ahora pide confirmación 2 para ejecutar ingest_10k año por año."
+        except Exception as exc:
+            return f"Error add_company_to_config: {exc}"
+
+    # Registro extensible: futuras tools (web_search...) se añaden a esta lista
+    return [query_financial_rag, lookup_metrics, financial_calculator, propose_new_company, add_company_to_config, ingest_tool]
+
+
+def _dynamic_ticker_pattern() -> "re.Pattern":
+    """Regex construida desde tickers base + companies.json (sin curado manual)."""
+    tickers = sorted(_allowed_tickers(), key=len, reverse=True)
+    return re.compile(r"\b(" + "|".join(re.escape(t) for t in tickers) + r")\b", re.IGNORECASE)
+
+
 def extract_ticker_year_fallback(question: str) -> tuple[Optional[str], Optional[int]]:
     """Fallback regex si la clasificación LLM no da ticker/year."""
-    m = _TICKER_RE.search(question or "")
+    m = _dynamic_ticker_pattern().search(question or "") or _TICKER_RE.search(question or "")
     ticker = m.group(1).upper() if m else None
-    if ticker == "BRKB":
-        ticker = "BRK.B"
+    from src.agent.company_registry import _ticker_key
+
+    if ticker:
+        by_key = {_ticker_key(t): t for t in _allowed_tickers()}
+        ticker = by_key.get(_ticker_key(ticker), ticker)
     y = None
     ym = re.search(r"\b(20(?:2[0-9]|19))\b", question or "")
     if ym:

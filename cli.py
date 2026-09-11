@@ -40,20 +40,67 @@ def build_agent(pipeline: FinancialGraphRAGPipeline):
     return build_agent_graph(pipeline)
 
 
-def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True) -> None:
+def build_react(pipeline: FinancialGraphRAGPipeline):
+    from src.agent.react_graph import build_react_agent
+
+    return build_react_agent(pipeline)
+
+
+def _pending_write_call(state, names=("ingest_10k", "add_company_to_config")) -> tuple[str, dict, str | None] | None:
+    """Inspecciona si el nodo tools pausado pide una tool de escritura. Devuelve (name, args, call_id) o None."""
+    try:
+        vals = state.values if hasattr(state, "values") else {}
+        msgs = vals.get("messages", []) if isinstance(vals, dict) else []
+        for m in reversed(msgs):
+            tool_calls = getattr(m, "tool_calls", None)
+            if not tool_calls and isinstance(m, dict):
+                tool_calls = m.get("tool_calls")
+            if tool_calls:
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        name, args, tc_id = tc.get("name", ""), tc.get("args", {}), tc.get("id")
+                    else:
+                        name, args, tc_id = getattr(tc, "name", ""), getattr(tc, "args", {}), getattr(tc, "id", None)
+                    if name in names:
+                        return name, (args if isinstance(args, dict) else {}), tc_id
+                return None
+    except Exception:
+        pass
+    return None
+
+
+def _pending_ingest_call(state) -> dict | None:
+    """Inspecciona si el nodo tools pausado pide ingest_10k. Devuelve args o None."""
+    hit = _pending_write_call(state, names=("ingest_10k",))
+    return hit[1] if hit else None
+
+
+def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True, use_react: bool = False) -> None:
     print("=" * 60)
-    print("Financial GraphRAG - Chat interactivo (LangGraph con memoria Q/A)")
-    print("Recuerda preguntas/respuestas previas (no chunks). Escribe 'añade AAPL 2026' para ingesta con confirmación, o /help.")
+    if use_react:
+        print("Financial GraphRAG - Chat ReAct (tools + memoria)")
+        print("El modelo decide qué tool usar. 'añade AAPL 2026' pide confirmación, o /help.")
+    else:
+        print("Financial GraphRAG - Chat interactivo (LangGraph con memoria Q/A)")
+        print("Recuerda preguntas/respuestas previas (no chunks). Escribe 'añade AAPL 2026' para ingesta con confirmación, o /help.")
     print("=" * 60)
 
     agent = None
+    react_agent = None
     if use_agent:
-        try:
-            agent = build_agent(pipeline)
-            print("[Agent LangGraph activo: memoria Q/A + intent classify + HITL ingest_tool]")
-        except Exception as exc:
-            logger.warning("No se pudo inicializar agente, fallback a pipeline directo: %s", exc)
-            agent = None
+        if use_react:
+            try:
+                react_agent = build_react(pipeline)
+                print("[Agent ReAct activo: query_financial_rag + lookup_metrics + calculator + propose_new_company + add_company_to_config/ingest_10k HITL]")
+            except Exception as exc:
+                logger.warning("No se pudo inicializar ReAct, fallback a pipeline directo: %s", exc)
+        else:
+            try:
+                agent = build_agent(pipeline)
+                print("[Agent LangGraph activo: memoria Q/A + intent classify + HITL ingest_tool]")
+            except Exception as exc:
+                logger.warning("No se pudo inicializar agente, fallback a pipeline directo: %s", exc)
+                agent = None
 
     import uuid
 
@@ -105,6 +152,71 @@ def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True) -> Non
         if question.startswith("/"):
             print(f"Comando desconocido: {question}")
             continue
+
+        # ReAct path: el modelo decide tools (con HITL solo para ingest_10k)
+        if react_agent is not None:
+            print("\nConsultando (react)...\n")
+            try:
+                from langchain_core.messages import HumanMessage
+
+                config = {"configurable": {"thread_id": conversation_thread_id}}
+                result = react_agent.invoke(
+                    {"messages": [HumanMessage(content=question)]}, config=config
+                )
+                # Bucle HITL: el grafo pausa antes de cada tool call.
+                # Solo add_company_to_config e ingest_10k piden confirmación; el resto se reanuda solo.
+                for _ in range(10):  # cota anti-loops del modelo
+                    state = react_agent.get_state(config)
+                    if not state.next:
+                        break
+                    pending = _pending_write_call(state)
+                    if pending:
+                        name, args, tc_id = pending
+                        if name == "add_company_to_config":
+                            print(f"[ReAct] El modelo quiere añadir {args.get('ticker')} a companies.json.")
+                            print("¿Confirmas editar companies.json? (y/n): ", end="", flush=True)
+                            cancel_msg = "Alta cancelada por el usuario. No se ha modificado companies.json."
+                        else:
+                            print(
+                                f"[ReAct] El modelo quiere ingerir: {args.get('ticker')} / {args.get('year')}"
+                            )
+                            print("¿Confirmas ingesta? (y/n): ", end="", flush=True)
+                            cancel_msg = "Ingesta cancelada por el usuario. Responde con retrieval existente."
+                        confirm = input().strip().lower()
+                        if confirm in ("y", "yes", "s", "si"):
+                            print("Confirmado, ejecutando..." if name == "add_company_to_config" else "Ingiriendo...")
+                            result = react_agent.invoke(None, config=config)
+                        else:
+                            print("Cancelado por el usuario.")
+                            from langchain_core.messages import ToolMessage
+
+                            if tc_id:
+                                react_agent.update_state(
+                                    config,
+                                    {"messages": [ToolMessage(content=cancel_msg, tool_call_id=tc_id)]},
+                                )
+                                result = react_agent.invoke(None, config=config)
+                            else:
+                                result = {"messages": []}
+                    else:
+                        # Pausa por otra tool (retrieval/metrics/calculator/propose): reanuda automáticamente
+                        result = react_agent.invoke(None, config=config)
+                msgs = result.get("messages", []) if isinstance(result, dict) else []
+                answer = ""
+                for m in reversed(msgs):
+                    if isinstance(m, dict):
+                        role, content, tcs = m.get("type", ""), m.get("content", ""), m.get("tool_calls")
+                    else:
+                        role, content, tcs = getattr(m, "type", ""), getattr(m, "content", ""), getattr(m, "tool_calls", None)
+                    if role == "ai" and content and not tcs:
+                        answer = content if isinstance(content, str) else str(content)
+                        break
+                print("-" * 60)
+                print(answer or "(sin respuesta del modelo; revisa logs)")
+                print("-" * 60)
+                continue
+            except Exception as exc:
+                logger.warning("ReAct falló, fallback a pipeline: %s", exc)
 
         # LangGraph agent path con HITL y memoria conversacional
         if agent is not None:
@@ -239,6 +351,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         action="store_true",
         help="Desactiva LangGraph agent y usa pipeline directo",
     )
+    parser.add_argument(
+        "--react",
+        action="store_true",
+        help="Usa agente ReAct (el modelo decide tools) en vez del determinista",
+    )
     args = parser.parse_args(argv)
 
     load_env()
@@ -256,7 +373,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             pipeline.ingest_companies()
             print("Ingesta completada.")
 
-        run_repl(pipeline, use_agent=not args.no_agent)
+        run_repl(pipeline, use_agent=not args.no_agent, use_react=args.react)
     finally:
         pipeline.close()
 

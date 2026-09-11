@@ -215,6 +215,15 @@ class RetrievalPipeline:
         for alias, ticker in self._COMPANY_ALIAS_TO_TICKER.items():
             if re.search(r"\b" + re.escape(alias) + r"\b", q_low):
                 return {ticker}
+        # Tickers dados de alta en companies.json (dinámico, sin curado)
+        try:
+            from src.agent.company_registry import get_config_tickers
+
+            for t in sorted(get_config_tickers(), key=len, reverse=True):
+                if re.search(r"\b" + re.escape(t) + r"\b", question or "", re.IGNORECASE):
+                    return {t.upper()}
+        except Exception:
+            pass
         return set()
 
     def _ground_to_query(

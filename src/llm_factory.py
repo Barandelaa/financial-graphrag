@@ -52,6 +52,7 @@ def create_llm(
     keep_alive: str = "10m",
     num_thread: Optional[int] = None,
     timeout: int = 180,
+    json_mode: bool = True,
 ) -> BaseChatModel:
     if prefer_ollama and _ollama_available(ollama_base_url, ollama_model):
         try:
@@ -74,10 +75,12 @@ def create_llm(
             num_ctx=num_ctx,
             keep_alive=keep_alive,
             timeout=timeout,
-            format="json",
             # qwen3: desactiva thinking (<think> vacía JSON y explica tus Invalid json output)
             reasoning=False,
         )
+        # ReAct necesita tool_calls nativos: sin format=json. Solo el extractor/grafo determinista lo usa.
+        if json_mode:
+            kwargs["format"] = "json"
         if num_thread is not None:
             kwargs["num_thread"] = num_thread
         try:

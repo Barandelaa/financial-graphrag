@@ -127,6 +127,17 @@ class MetricsTableRetriever:
             ticker = _ALIAS_TO_TICKER.get(key)
             if ticker and ticker not in hits:
                 hits.append(ticker)
+        # tickers dados de alta en companies.json (dinámico, sin curado)
+        try:
+            from src.agent.company_registry import get_config_tickers
+
+            for t in get_config_tickers():
+                if re.search(r"\b" + re.escape(t) + r"\b", q, re.IGNORECASE) and t not in hits:
+                    # evita duplicar variante con/sin punto
+                    if not any(h.upper().replace(".", "") == t.replace(".", "") for h in hits):
+                        hits.append(t)
+        except Exception:
+            pass
         # normaliza a mayúsculas y deduplica manteniendo orden
         seen = []
         for h in hits:
