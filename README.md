@@ -62,7 +62,7 @@ Empresas `data/companies.json` `2024–2025`: `AAPL, MSFT, AMZN, GOOGL, NVDA, ME
 * **Grafo (tras limpieza 5180 viejos):** `7907` `FinancialMetric` (`7837` con `value`, `id` scoping), `Company 216`, `BusinessSegment ~1273`, `216` `COMPETES_WITH`-like; `DocumentChunk 3067`; `REPORTED_METRIC 7923`, `OPERATES_IN ~1380`, `MENTIONS_EVENT ~2038`. `AMZN_2024` y `MSFT_2025` ya sin huecos.
 * **Vector:** `LanceDB 1928→3067 rows`, `BM25` rebuild desde Lance, `bge-m3` + `bge-reranker-v2-m3`.
 
-> **Aviso:** `data/` (`10-K`, `chunks`, `lancedb`, `kuzu_db`) no está en el repo (`.gitignore:12`) y pesa `>500 MB`. Al clonar `python cli.py --ingest --workers 2 --batch-size 1` tarda horas (extracción `workers 2 batch 1` + `reasoning=False` es el path estable para 12GB). `docs/` (`docs/langchain.md` tutorial local) también está ignorado (`.gitignore:33`).
+> **Aviso:** El contenido generado de `data/` (`10-K`, `chunks`, `lancedb`, `kuzu_db`) no está en el repo (`.gitignore`) y pesa `>500 MB` (solo se incluye la configuración inicial `data/companies.json`). Al clonar, `python cli.py --ingest --workers 4 --batch-size 1` tarda horas (extracción `workers 4 batch 1` + `reasoning=False` es el path estable para 12GB), los workers y batches dependerán del hardware. `docs/` (tutoriales y apuntes locales) también está ignorado (`.gitignore`).
 
 ## Instalación
 

@@ -10,7 +10,9 @@ dist/
 .ipython/
 
 # === Datos generados (10-K descargados, chunks, índices, grafo) ===
-data/
+data/*
+!data/companies.json
+*.bak
 
 # === Resultados de evaluación ===
 evals/results/

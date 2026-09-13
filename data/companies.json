@@ -1,0 +1,17 @@
+{
+  "companies": [
+    "AAPL",
+    "AMZN",
+    "BRK.B",
+    "FLNC",
+    "GOOGL",
+    "META",
+    "MSFT",
+    "NVDA",
+    "TSLA"
+  ],
+  "default_years": [
+    2024,
+    2025
+  ]
+}
