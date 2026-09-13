@@ -42,7 +42,7 @@ STRICT RULES:
 - NEVER state that something 'has no 10-K / does not exist' without having called propose_new_company first. When retrieval is empty, ASK or PROPOSE — do not issue verdicts from memory.
 - Cite as [Source: TICKER | FY YEAR | SECTION | chunk: CHUNK_ID].
 - If the context lacks the exact figure, say so explicitly.
-- Never call ingest_10k or add_company_to_config without the user's explicit confirmation (the CLI pauses and asks; if they answer 'n', respect the cancellation).
+- Never call ingest_10k or add_company_to_config without the user's explicit confirmation (each tool pauses itself with interrupt() and the CLI asks; if they answer 'n', respect the cancellation).
 - Reply in the user's language, concise and with citations.
 """
 
@@ -58,22 +58,20 @@ def build_react_llm(base_llm: BaseChatModel | None = None) -> BaseChatModel:
 def build_react_agent(
     pipeline: FinancialGraphRAGPipeline,
     llm: BaseChatModel | None = None,
-    interrupt_before_ingest: bool = True,
 ):
-    """Crea el agente ReAct con las tools base + memoria. Extensible añadiendo tools a make_react_tools()."""
+    """Crea el agente ReAct con las tools base + memoria. Extensible añadiendo tools a make_react_tools().
+
+    El HITL vive dentro de las propias tools (interrupt() en add_company_to_config
+    e ingest_10k); el checkpointer es obligatorio para poder reanudar con Command(resume=...).
+    """
     react_llm = llm or build_react_llm()
     tools = make_react_tools(pipeline)
-    checkpointer = MemorySaver()
-    kwargs: dict = dict(
+    agent = create_react_agent(
         model=react_llm,
         tools=tools,
         prompt=REACT_SYSTEM_PROMPT,
-        checkpointer=checkpointer,
+        checkpointer=MemorySaver(),
     )
-    if interrupt_before_ingest:
-        # HITL: pausa antes de ejecutar ingest_10k, igual que el determinista
-        kwargs["interrupt_before"] = ["tools"]
-    agent = create_react_agent(**kwargs)
     # expone tools para tests / futuras extensiones
     agent.react_tools = tools  # type: ignore
     return agent

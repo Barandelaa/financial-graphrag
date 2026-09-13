@@ -21,10 +21,21 @@ def _allowed_tickers() -> set[str]:
     return set(_VALID_TICKERS) | {t.upper() for t in get_config_tickers()}
 
 
-def _make_ingest_tool(pipeline: FinancialGraphRAGPipeline):
+def _confirmed(value: object) -> bool:
+    """El resume del interrupt() trae el 'y/n' del CLI (o True desde API)."""
+    if value is True:
+        return True
+    return str(value or "").strip().lower() in ("y", "yes", "s", "si", "true", "ok")
+
+
+def _make_ingest_tool(pipeline: FinancialGraphRAGPipeline, confirm_inside: bool = False):
+    """Si confirm_inside=True, la confirmación HITL se pide dentro de la tool
+    con interrupt() (patrón ReAct). Si False, la pausa la gestiona el llamador
+    a nivel de nodo (patrón agente determinista)."""
+
     @tool
     def ingest_10k(ticker: str, year: int, use_cache: bool = False) -> str:
-        """Ingiere el 10-K de la SEC para un ticker y año y lo indexa en grafo+vector. Usar SOLO cuando el usuario pide explícitamente añadir/ingerir un ticker/año nuevo (ej: 'añade AAPL 2026') y TRAS confirmación. ticker: cualquiera dado de alta en companies.json, year: 2020-2026."""
+        """Ingiere el 10-K de la SEC para un ticker y año y lo indexa en grafo+vector. Usar SOLO cuando el usuario pide explícitamente añadir/ingerir un ticker/año nuevo (ej: 'añade AAPL 2026'). La confirmación se pide automáticamente antes de ejecutar. ticker: cualquiera dado de alta en companies.json, year: 2020-2026."""
         from src.agent.company_registry import _ticker_key
 
         allowed = _allowed_tickers()
@@ -39,6 +50,12 @@ def _make_ingest_tool(pipeline: FinancialGraphRAGPipeline):
             return f"Error: year '{year}' invalido"
         if not (2020 <= y <= 2026):
             return f"Error: year {y} fuera de rango 2020-2026"
+        if confirm_inside:
+            from langgraph.types import interrupt
+
+            ok = interrupt({"action": "confirm_ingest", "ticker": t, "year": y})
+            if not _confirmed(ok):
+                return f"Ingesta cancelada por el usuario. No se ha ingerido {t}/{y}."
         try:
             chunks = pipeline.ingest_and_index(ticker=t, year=y, use_cache=use_cache)
             return f"OK: Ingested {len(chunks)} chunks for {t}/{y} -> data/processed_chunks/{t}_{y}/chunks.json + triplets.json (use_cache={use_cache})"
@@ -53,7 +70,7 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
     """Tools base para el agente ReAct. Lista extensible: añade aquí futuras tools."""
     from langchain_core.tools import tool as _tool
 
-    ingest_tool = _make_ingest_tool(pipeline)
+    ingest_tool = _make_ingest_tool(pipeline, confirm_inside=True)
     rp = pipeline.retrieval
 
     @_tool
@@ -180,10 +197,24 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
 
     @_tool
     def add_company_to_config(ticker: str) -> str:
-        """Añade un ticker YA CONFIRMADO por el usuario a data/companies.json (con backup .bak). Usar SOLO tras confirmación 1 explícita. No ingiere nada; la ingesta va después con ingest_10k tras confirmación 2."""
-        try:
-            from src.agent.company_registry import add_company, get_config_years, record_resolution
+        """Añade un ticker a data/companies.json (con backup .bak). La confirmación se pide automáticamente antes de escribir. No ingiere nada; la ingesta va después con ingest_10k."""
+        from src.agent.company_registry import (
+            _ticker_key,
+            add_company,
+            get_config_tickers,
+            get_config_years,
+            record_resolution,
+        )
+        from langgraph.types import interrupt
 
+        t = (ticker or "").strip().upper()
+        if _ticker_key(t) in {_ticker_key(c) for c in get_config_tickers()}:
+            return f"{t} ya está dado de alta en companies.json. Pide confirmación 2 para ejecutar ingest_10k."
+        # FUERA del try: interrupt() lanza GraphInterrupt y no debe ser tragado por el except.
+        ok = interrupt({"action": "confirm_add_company", "ticker": t, "years": get_config_years()})
+        if not _confirmed(ok):
+            return "Alta cancelada por el usuario. No se ha modificado companies.json."
+        try:
             out = add_company(ticker)
             record_resolution(ticker, out["ticker"])
             return f"OK: {out['ticker']} dado de alta. companies: {out['before']} -> {out['after']}. Años: {get_config_years()}. Ahora pide confirmación 2 para ejecutar ingest_10k año por año."

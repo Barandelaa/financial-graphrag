@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import collections
+import dataclasses
+import enum
 import logging
 import sys
-from typing import List, Optional
+import uuid
+from typing import Callable, List, Optional
 
 from src.env import load_env
 from src.llm_factory import create_llm
@@ -46,33 +50,250 @@ def build_react(pipeline: FinancialGraphRAGPipeline):
     return build_react_agent(pipeline)
 
 
-def _pending_write_call(state, names=("ingest_10k", "add_company_to_config")) -> tuple[str, dict, str | None] | None:
-    """Inspecciona si el nodo tools pausado pide una tool de escritura. Devuelve (name, args, call_id) o None."""
+class _Action(enum.Enum):
+    CONTINUE = "continue"
+    ASK_MODEL = "ask_model"
+    QUIT = "quit"
+
+
+@dataclasses.dataclass
+class _ReplCtx:
+    pipeline: FinancialGraphRAGPipeline
+    agent: Optional[object] = None
+    react_agent: Optional[object] = None
+    thread_id: str = ""
+
+
+# --- Comandos REPL: tabla de despacho (añadir uno nuevo = una entrada) ---
+
+def _cmd_quit(ctx: _ReplCtx, text: str) -> _Action:
+    print("Saliendo...")
+    return _Action.QUIT
+
+
+def _cmd_help(ctx: _ReplCtx, text: str) -> _Action:
+    print(HELP_TEXT + "\n\nModo agente: escribe 'añade TICKER AÑO' (ej: añade AAPL 2026) para ingesta con confirmación.\nMemoria: recuerda últimas Q/A para '¿y en 2023?' sin repetir ticker.")
+    return _Action.CONTINUE
+
+
+def _cmd_clear(ctx: _ReplCtx, text: str) -> _Action:
+    print("\033c", end="")
+    ctx.thread_id = str(uuid.uuid4())
+    print(f"[Memoria limpiada, nuevo thread {ctx.thread_id[:8]}]")
+    return _Action.CONTINUE
+
+
+def _cmd_ingest_all(ctx: _ReplCtx, text: str) -> _Action:
+    print("Ingiriendo todas las empresas del config...")
+    ctx.pipeline.ingest_companies()
+    print("Ingesta completada.")
+    return _Action.CONTINUE
+
+
+def _cmd_ingest(ctx: _ReplCtx, text: str) -> _Action:
+    parts = text.split()
+    if len(parts) < 3:
+        print("Uso: /ingest <ticker> <año>")
+        return _Action.CONTINUE
     try:
-        vals = state.values if hasattr(state, "values") else {}
-        msgs = vals.get("messages", []) if isinstance(vals, dict) else []
-        for m in reversed(msgs):
-            tool_calls = getattr(m, "tool_calls", None)
-            if not tool_calls and isinstance(m, dict):
-                tool_calls = m.get("tool_calls")
-            if tool_calls:
-                for tc in tool_calls:
-                    if isinstance(tc, dict):
-                        name, args, tc_id = tc.get("name", ""), tc.get("args", {}), tc.get("id")
-                    else:
-                        name, args, tc_id = getattr(tc, "name", ""), getattr(tc, "args", {}), getattr(tc, "id", None)
-                    if name in names:
-                        return name, (args if isinstance(args, dict) else {}), tc_id
-                return None
-    except Exception:
-        pass
-    return None
+        year = int(parts[2])
+    except ValueError:
+        print(f"Año inválido: {parts[2]}")
+        return _Action.CONTINUE
+    print(f"Ingiriendo {parts[1].upper()} / {year}...")
+    ctx.pipeline.ingest_and_index(parts[1].upper(), year)
+    print("Ingesta completada.")
+    return _Action.CONTINUE
 
 
-def _pending_ingest_call(state) -> dict | None:
-    """Inspecciona si el nodo tools pausado pide ingest_10k. Devuelve args o None."""
-    hit = _pending_write_call(state, names=("ingest_10k",))
-    return hit[1] if hit else None
+_COMMANDS: dict[str, Callable[[_ReplCtx, str], _Action]] = {
+    "/exit": _cmd_quit,
+    "/quit": _cmd_quit,
+    "/help": _cmd_help,
+    "/clear": _cmd_clear,
+    "/ingest-all": _cmd_ingest_all,
+}
+
+
+def dispatch_command(ctx: _ReplCtx, question: str) -> _Action:
+    if not question:
+        return _Action.CONTINUE
+    if question.startswith("/ingest "):
+        return _cmd_ingest(ctx, question)
+    handler = _COMMANDS.get(question.split()[0])
+    if handler is None:
+        if question.startswith("/"):
+            print(f"Comando desconocido: {question}")
+            return _Action.CONTINUE
+        return _Action.ASK_MODEL
+    return handler(ctx, question)
+
+
+# --- Interrupts HITL: registro (una futura tool con HITL = una entrada) ---
+
+@dataclasses.dataclass
+class _InterruptSpec:
+    notice: str
+    question: str
+
+
+INTERRUPT_HANDLERS: dict[str, _InterruptSpec] = {
+    "confirm_add_company": _InterruptSpec(
+        "[ReAct] El modelo quiere añadir {ticker} a companies.json.",
+        "¿Confirmas editar companies.json? (y/n): ",
+    ),
+    "confirm_ingest": _InterruptSpec(
+        "[ReAct] El modelo quiere ingerir: {ticker} / {year}",
+        "¿Confirmas ingesta? (y/n): ",
+    ),
+}
+
+
+# --- Prints compartido ---
+
+def extract_last_answer(messages) -> str:
+    for m in reversed(messages or []):
+        if isinstance(m, dict):
+            role, content, tcs = m.get("type", ""), m.get("content", ""), m.get("tool_calls")
+        else:
+            role, content, tcs = getattr(m, "type", ""), getattr(m, "content", ""), getattr(m, "tool_calls", None)
+        if role == "ai" and content and not tcs:
+            return content if isinstance(content, str) else str(content)
+    return ""
+
+
+def print_answer_block(answer: str) -> None:
+    print("-" * 60)
+    print(answer or "(sin respuesta del modelo; revisa logs)")
+    print("-" * 60)
+
+
+def print_agent_result(answer: str, citations, facts, metrics, warn_if_empty: bool = True) -> None:
+    print("-" * 60)
+    print(answer)
+    print("-" * 60)
+    print(f"[Facts: {len(facts)} | Metrics: {len(metrics)} | Citations: {len(citations)}]")
+    if citations:
+        print("\nCitas:")
+        for c in citations[:5]:
+            print(f"  - {c}")
+    if warn_if_empty and not answer:
+        print("\n(No se generó respuesta; revisa los logs.)")
+
+
+def print_pipeline_result(result) -> None:
+    print("-" * 60)
+    print(result.answer)
+    print("-" * 60)
+    print(
+        f"[Dense: {result.dense_results} | Sparse: {result.sparse_results} | "
+        f"Graph: {result.graph_results} | Facts: {len(result.graph_facts)}]"
+    )
+    if result.citations:
+        print("\nCitas:")
+        for c in result.citations:
+            print(f"  - {c}")
+    if not result.answer:
+        print("\n(No se generó respuesta; revisa los logs.)")
+
+
+# --- Turnos por modo (True = gestionado, False = fallback al siguiente) ---
+
+def run_react_turn(react_agent, question: str, thread_id: str) -> bool:
+    print("\nConsultando (react)...\n")
+    try:
+        from langchain_core.messages import HumanMessage
+        from langgraph.types import Command
+
+        config = {"configurable": {"thread_id": thread_id}}
+        result = react_agent.invoke(
+            {"messages": [HumanMessage(content=question)]}, config=config
+        )
+        for _ in range(10):  # cota anti-loops del modelo
+            state = react_agent.get_state(config)
+            pending = [i for t in state.tasks for i in (t.interrupts or [])]
+            if not pending:
+                if not state.next:
+                    break
+                result = react_agent.invoke(None, config=config)
+                continue
+            payload = pending[0].value or {}
+            spec = INTERRUPT_HANDLERS.get(payload.get("action", ""))
+            if spec is None:
+                # Interrupt desconocido: reanuda sin valor
+                result = react_agent.invoke(Command(resume=None), config=config)
+                continue
+            print(spec.notice.format_map(collections.defaultdict(str, payload)))
+            confirm = input(spec.question).strip().lower()
+            if confirm not in ("y", "yes", "s", "si"):
+                print("Cancelado por el usuario.")
+            result = react_agent.invoke(Command(resume=confirm), config=config)
+        msgs = result.get("messages", []) if isinstance(result, dict) else []
+        print_answer_block(extract_last_answer(msgs))
+        return True
+    except Exception as exc:
+        logger.warning("ReAct falló, fallback a pipeline: %s", exc)
+        return False
+
+
+def run_agent_turn(agent, pipeline: FinancialGraphRAGPipeline, question: str, thread_id: str) -> bool:
+    print("\nConsultando (agent)...\n")
+    try:
+        config = {"configurable": {"thread_id": thread_id}}
+        # 1º invoke hasta interrupt_before ingest_tool o END
+        result = agent.invoke({"question": question}, config=config)
+        state = agent.get_state(config)
+        if state.next and "ingest_tool" in state.next:
+            vals = state.values
+            ticker = vals.get("ticker")
+            year = vals.get("year")
+            print(f"[Agent] Detectado intento de ingesta: {ticker} / {year}")
+            print(f"¿Confirmas ingesta de {ticker} {year}? (y/n): ", end="", flush=True)
+            confirm = input().strip().lower()
+            if confirm in ("y", "yes", "s", "si"):
+                print(f"Ingiriendo {ticker}/{year}...")
+                result = agent.invoke(None, config=config)
+                ingest_msg = result.get("ingest_result") or str(result)
+                print(ingest_msg)
+                for m in result.get("messages", [])[-2:]:
+                    if isinstance(m, dict) and m.get("content"):
+                        print(m["content"])
+                    elif hasattr(m, "content"):
+                        print(m.content)
+            else:
+                print("Ingesta cancelada, haciendo retrieval en su lugar...")
+                from src.agent.graph import build_agent_graph_no_interrupt
+
+                agent2 = build_agent_graph_no_interrupt(pipeline)
+                result = agent2.invoke({"question": question, "intent": "retrieve", "ticker": None, "year": None}, config={"configurable": {"thread_id": thread_id}})
+                print_agent_result(
+                    result.get("answer", ""),
+                    result.get("citations", []),
+                    result.get("graph_facts", []),
+                    result.get("metrics_rows", []),
+                    warn_if_empty=False,
+                )
+            return True
+        print_agent_result(
+            result.get("answer", ""),
+            result.get("citations", []),
+            result.get("graph_facts", []),
+            result.get("metrics_rows", []),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Agent falló, fallback a pipeline: %s", exc)
+        return False
+
+
+def run_pipeline_turn(pipeline: FinancialGraphRAGPipeline, question: str) -> None:
+    print("\nConsultando (pipeline)...\n")
+    try:
+        result = pipeline.query(question)
+    except Exception as exc:
+        print(f"Error al consultar: {exc}")
+        return
+    print_pipeline_result(result)
 
 
 def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True, use_react: bool = False) -> None:
@@ -102,11 +323,9 @@ def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True, use_re
                 logger.warning("No se pudo inicializar agente, fallback a pipeline directo: %s", exc)
                 agent = None
 
-    import uuid
-
     # thread_id persistente para memoria conversacional (no uuid por pregunta)
-    conversation_thread_id = str(uuid.uuid4())
-    print(f"[Memoria conversacional: thread {conversation_thread_id[:8]} | /clear limpia historial]")
+    ctx = _ReplCtx(pipeline=pipeline, agent=agent, react_agent=react_agent, thread_id=str(uuid.uuid4()))
+    print(f"[Memoria conversacional: thread {ctx.thread_id[:8]} | /clear limpia historial]")
 
     while True:
         try:
@@ -115,197 +334,18 @@ def run_repl(pipeline: FinancialGraphRAGPipeline, use_agent: bool = True, use_re
             print("\nSaliendo...")
             break
 
-        if not question:
-            continue
-
-        if question in ("/exit", "/quit"):
-            print("Saliendo...")
+        action = dispatch_command(ctx, question)
+        if action is _Action.QUIT:
             break
-        if question == "/help":
-            print(HELP_TEXT + "\n\nModo agente: escribe 'añade TICKER AÑO' (ej: añade AAPL 2026) para ingesta con confirmación.\nMemoria: recuerda últimas Q/A para '¿y en 2023?' sin repetir ticker.")
-            continue
-        if question == "/clear":
-            print("\033c", end="")
-            # limpia memoria conversacional
-            conversation_thread_id = str(uuid.uuid4())
-            print(f"[Memoria limpiada, nuevo thread {conversation_thread_id[:8]}]")
-            continue
-        if question == "/ingest-all":
-            print("Ingiriendo todas las empresas del config...")
-            pipeline.ingest_companies()
-            print("Ingesta completada.")
-            continue
-        if question.startswith("/ingest "):
-            parts = question.split()
-            if len(parts) < 3:
-                print("Uso: /ingest <ticker> <año>")
-                continue
-            try:
-                year = int(parts[2])
-            except ValueError:
-                print(f"Año inválido: {parts[2]}")
-                continue
-            print(f"Ingiriendo {parts[1].upper()} / {year}...")
-            pipeline.ingest_and_index(parts[1].upper(), year)
-            print("Ingesta completada.")
-            continue
-        if question.startswith("/"):
-            print(f"Comando desconocido: {question}")
+        if action is _Action.CONTINUE:
             continue
 
-        # ReAct path: el modelo decide tools (con HITL solo para ingest_10k)
-        if react_agent is not None:
-            print("\nConsultando (react)...\n")
-            try:
-                from langchain_core.messages import HumanMessage
-
-                config = {"configurable": {"thread_id": conversation_thread_id}}
-                result = react_agent.invoke(
-                    {"messages": [HumanMessage(content=question)]}, config=config
-                )
-                # Bucle HITL: el grafo pausa antes de cada tool call.
-                # Solo add_company_to_config e ingest_10k piden confirmación; el resto se reanuda solo.
-                for _ in range(10):  # cota anti-loops del modelo
-                    state = react_agent.get_state(config)
-                    if not state.next:
-                        break
-                    pending = _pending_write_call(state)
-                    if pending:
-                        name, args, tc_id = pending
-                        if name == "add_company_to_config":
-                            print(f"[ReAct] El modelo quiere añadir {args.get('ticker')} a companies.json.")
-                            print("¿Confirmas editar companies.json? (y/n): ", end="", flush=True)
-                            cancel_msg = "Alta cancelada por el usuario. No se ha modificado companies.json."
-                        else:
-                            print(
-                                f"[ReAct] El modelo quiere ingerir: {args.get('ticker')} / {args.get('year')}"
-                            )
-                            print("¿Confirmas ingesta? (y/n): ", end="", flush=True)
-                            cancel_msg = "Ingesta cancelada por el usuario. Responde con retrieval existente."
-                        confirm = input().strip().lower()
-                        if confirm in ("y", "yes", "s", "si"):
-                            print("Confirmado, ejecutando..." if name == "add_company_to_config" else "Ingiriendo...")
-                            result = react_agent.invoke(None, config=config)
-                        else:
-                            print("Cancelado por el usuario.")
-                            from langchain_core.messages import ToolMessage
-
-                            if tc_id:
-                                react_agent.update_state(
-                                    config,
-                                    {"messages": [ToolMessage(content=cancel_msg, tool_call_id=tc_id)]},
-                                )
-                                result = react_agent.invoke(None, config=config)
-                            else:
-                                result = {"messages": []}
-                    else:
-                        # Pausa por otra tool (retrieval/metrics/calculator/propose): reanuda automáticamente
-                        result = react_agent.invoke(None, config=config)
-                msgs = result.get("messages", []) if isinstance(result, dict) else []
-                answer = ""
-                for m in reversed(msgs):
-                    if isinstance(m, dict):
-                        role, content, tcs = m.get("type", ""), m.get("content", ""), m.get("tool_calls")
-                    else:
-                        role, content, tcs = getattr(m, "type", ""), getattr(m, "content", ""), getattr(m, "tool_calls", None)
-                    if role == "ai" and content and not tcs:
-                        answer = content if isinstance(content, str) else str(content)
-                        break
-                print("-" * 60)
-                print(answer or "(sin respuesta del modelo; revisa logs)")
-                print("-" * 60)
-                continue
-            except Exception as exc:
-                logger.warning("ReAct falló, fallback a pipeline: %s", exc)
-
-        # LangGraph agent path con HITL y memoria conversacional
-        if agent is not None:
-            print("\nConsultando (agent)...\n")
-            try:
-                config = {"configurable": {"thread_id": conversation_thread_id}}
-                # 1º invoke hasta interrupt_before ingest_tool o END
-                result = agent.invoke({"question": question}, config=config)
-                # Si hay interrupt (ingest), result contiene ingest_request pendiente
-                # Detecta si el grafo se pausó
-                state = agent.get_state(config)
-                if state.next and "ingest_tool" in state.next:
-                    vals = state.values
-                    ticker = vals.get("ticker")
-                    year = vals.get("year")
-                    print(f"[Agent] Detectado intento de ingesta: {ticker} / {year}")
-                    print(f"¿Confirmas ingesta de {ticker} {year}? (y/n): ", end="", flush=True)
-                    confirm = input().strip().lower()
-                    if confirm in ("y", "yes", "s", "si"):
-                        print(f"Ingiriendo {ticker}/{year}...")
-                        # reanuda (ejecutará ingest_tool)
-                        result = agent.invoke(None, config=config)
-                        ingest_msg = result.get("ingest_result") or str(result)
-                        print(ingest_msg)
-                        # muestra tool result si es ingest
-                        for m in result.get("messages", [])[-2:]:
-                            if isinstance(m, dict) and m.get("content"):
-                                print(m["content"])
-                            elif hasattr(m, "content"):
-                                print(m.content)
-                    else:
-                        print("Ingesta cancelada, haciendo retrieval en su lugar...")
-                        # cancela ingest y fuerza retrieve con mismo thread (mantiene memoria)
-                        from src.agent.graph import build_agent_graph_no_interrupt
-
-                        agent2 = build_agent_graph_no_interrupt(pipeline)
-                        # fuerza intent retrieve
-                        result = agent2.invoke({"question": question, "intent": "retrieve", "ticker": None, "year": None}, config={"configurable": {"thread_id": conversation_thread_id}})
-                        answer = result.get("answer", "")
-                        citations = result.get("citations", [])
-                        facts = result.get("graph_facts", [])
-                        metrics = result.get("metrics_rows", [])
-                        print("-" * 60)
-                        print(answer)
-                        print("-" * 60)
-                        print(f"[Facts: {len(facts)} | Metrics: {len(metrics)} | Citations: {len(citations)}]")
-                        if citations:
-                            for c in citations[:5]:
-                                print(f"  - {c}")
-                    continue
-                # No fue ingest → es retrieval
-                answer = result.get("answer", "")
-                citations = result.get("citations", [])
-                facts = result.get("graph_facts", [])
-                metrics = result.get("metrics_rows", [])
-                print("-" * 60)
-                print(answer)
-                print("-" * 60)
-                print(f"[Facts: {len(facts)} | Metrics: {len(metrics)} | Citations: {len(citations)}]")
-                if citations:
-                    print("\nCitas:")
-                    for c in citations[:5]:
-                        print(f"  - {c}")
-                if not answer:
-                    print("\n(No se generó respuesta; revisa los logs.)")
-                continue
-            except Exception as exc:
-                logger.warning("Agent falló, fallback a pipeline: %s", exc)
-
-        print("\nConsultando (pipeline)...\n")
-        try:
-            result = pipeline.query(question)
-        except Exception as exc:
-            print(f"Error al consultar: {exc}")
+        # Turnos por modo con fallback en cadena: react → determinista → pipeline.
+        if ctx.react_agent is not None and run_react_turn(ctx.react_agent, question, ctx.thread_id):
             continue
-
-        print("-" * 60)
-        print(result.answer)
-        print("-" * 60)
-        print(
-            f"[Dense: {result.dense_results} | Sparse: {result.sparse_results} | "
-            f"Graph: {result.graph_results} | Facts: {len(result.graph_facts)}]"
-        )
-        if result.citations:
-            print("\nCitas:")
-            for c in result.citations:
-                print(f"  - {c}")
-        if not result.answer:
-            print("\n(No se generó respuesta; revisa los logs.)")
+        if ctx.agent is not None and run_agent_turn(ctx.agent, pipeline, question, ctx.thread_id):
+            continue
+        run_pipeline_turn(pipeline, question)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
