@@ -199,37 +199,91 @@ def print_pipeline_result(result) -> None:
 
 # --- Turnos por modo (True = gestionado, False = fallback al siguiente) ---
 
+def _print_stream_text(text: str) -> bool:
+    """Imprime un fragmento de token y devuelve si el cursor queda a mitad de línea."""
+    print(text, end="", flush=True)
+    return not text.endswith("\n")
+
+
+def _ensure_newline(line_open: bool) -> bool:
+    if line_open:
+        print(flush=True)
+    return False
+
+
 def run_react_turn(react_agent, question: str, thread_id: str) -> bool:
     print("\nConsultando (react)...\n")
+    print("-" * 60)
     try:
-        from langchain_core.messages import HumanMessage
+        from langchain_core.messages import AIMessageChunk, HumanMessage
         from langgraph.types import Command
 
         config = {"configurable": {"thread_id": thread_id}}
-        result = react_agent.invoke(
-            {"messages": [HumanMessage(content=question)]}, config=config
-        )
+        pending_input = {"messages": [HumanMessage(content=question)]}
+        announced_tools: set[str] = set()
+        streamed_any = False
+        line_open = False
         for _ in range(10):  # cota anti-loops del modelo
+            for msg_chunk, _metadata in react_agent.stream(
+                pending_input, config=config, stream_mode="messages"
+            ):
+                # En langchain_core>=1.x los chunks exponen type='AIMessageChunk'
+                if not isinstance(msg_chunk, AIMessageChunk) and getattr(
+                    msg_chunk, "type", ""
+                ) not in ("ai", "AIMessageChunk"):
+                    continue
+                for tc in getattr(msg_chunk, "tool_calls", None) or []:
+                    if isinstance(tc, dict):
+                        tc_id, tc_name = tc.get("id"), tc.get("name")
+                    else:
+                        tc_id, tc_name = getattr(tc, "id", None), getattr(tc, "name", "")
+                    key = tc_id or tc_name
+                    if key and key not in announced_tools:
+                        announced_tools.add(key)
+                        if tc_name:
+                            line_open = _ensure_newline(line_open)
+                            print(f">> {tc_name}...", flush=True)
+                            line_open = True
+                content = getattr(msg_chunk, "content", "")
+                if isinstance(content, list):
+                    text = "".join(
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                else:
+                    text = content if isinstance(content, str) else ""
+                if text:
+                    streamed_any = True
+                    line_open = _print_stream_text(text)
             state = react_agent.get_state(config)
             pending = [i for t in state.tasks for i in (t.interrupts or [])]
             if not pending:
                 if not state.next:
                     break
-                result = react_agent.invoke(None, config=config)
+                pending_input = None
                 continue
             payload = pending[0].value or {}
             spec = INTERRUPT_HANDLERS.get(payload.get("action", ""))
             if spec is None:
                 # Interrupt desconocido: reanuda sin valor
-                result = react_agent.invoke(Command(resume=None), config=config)
+                pending_input = Command(resume=None)
                 continue
+            line_open = _ensure_newline(line_open)
             print(spec.notice.format_map(collections.defaultdict(str, payload)))
             confirm = input(spec.question).strip().lower()
             if confirm not in ("y", "yes", "s", "si"):
                 print("Cancelado por el usuario.")
-            result = react_agent.invoke(Command(resume=confirm), config=config)
-        msgs = result.get("messages", []) if isinstance(result, dict) else []
-        print_answer_block(extract_last_answer(msgs))
+            pending_input = Command(resume=confirm)
+        if not streamed_any:
+            # Respaldo: si no llegó ningún token (p. ej. error a mitad de stream
+            # ya gestionado), muestra la última respuesta del estado.
+            state = react_agent.get_state(config)
+            msgs = state.values.get("messages", []) if isinstance(state.values, dict) else []
+            print_answer_block(extract_last_answer(msgs))
+            return True
+        line_open = _ensure_newline(line_open)
+        print("-" * 60)
         return True
     except Exception as exc:
         logger.warning("ReAct falló, fallback a pipeline: %s", exc)

@@ -32,6 +32,8 @@ Ingesta: PDF/HTML → Markdown → secciones (Item 1, 1A, 7, 8…)
         B) ReAct (--react): el modelo decide tools (create_react_agent + MemorySaver)
            tools: query_financial_rag | lookup_metrics | financial_calculator
                   propose_new_company | add_company_to_config (HITL 1) | ingest_10k (HITL 2)
+           HITL moderno nativo con interrupt() dentro de las tools y reanudación con Command(resume=...)
+           CLI con streaming token a token en tiempo real (stream_mode="messages") y anuncio dinámico de tools
         retrieve: expanded query (revenue→net sales) → dense/sparse/graph+metrics_table scoping
         RRF (k=60) → grounding por ticker → dedup
                     → reranker cross-encoder (bge-reranker-v2-m3)
@@ -48,7 +50,7 @@ Ingesta: PDF/HTML → Markdown → secciones (Item 1, 1A, 7, 8…)
 3. **Recuperación** (`src/retrieval/`): cada pregunta pasa por `expand_query` sinónimos, consulta los tres índices en paralelo + `MetricsTable` scoping (`c.ticker IN $tickers AND m.id CONTAINS '_'`), fusiona con **RRF**, filtra por ticker, dedup, reordena con **cross-encoder** y genera con **citas** (`CHUNK_ID` + `METRICS TABLE` con `section`).
 4. **Agentes** (`src/agent/`):
    - **Determinista**: `StateGraph` `classify_intent (with_structured_output IntentOutput ingest|retrieve) → parallel_retrieve → fuse_rerank (torch.cuda.empty_cache) → generate`. `ingest_10k(ticker,year)` con **HITL** `MemorySaver interrupt_before ingest_tool` y confirmación `y/n` en CLI. Memoria conversacional solo `Q/A` (no chunks, `4×500 chars`).
-   - **ReAct** (`--react`, `react_graph.py`, system prompt en inglés para `qwen3:8b`): `create_react_agent` con 6 tools — `query_financial_rag` (retrieval completo), `lookup_metrics` (cifras scoping), `financial_calculator` (`yoy_pct|pct_change|diff|ratio|sum|avg`, siempre con cifras de tools y mostrando `FORMULA`), `propose_new_company` (solo lectura: universo SEC + verificación 10-K en EDGAR), `add_company_to_config` (**HITL 1**: editar `companies.json` con backup `.bak`) e `ingest_10k` (**HITL 2**: ingesta). El LLM para ReAct se crea con `create_llm(json_mode=False)` para `tool_calls` nativos (el determinista/extractor usan `format=json`).
+   - **ReAct** (`--react`, `react_graph.py`, system prompt en inglés para `qwen3:8b`): `create_react_agent` con 6 tools — `query_financial_rag` (retrieval completo), `lookup_metrics` (cifras scoping), `financial_calculator` (`yoy_pct|pct_change|diff|ratio|sum|avg`, siempre con cifras de tools y mostrando `FORMULA`), `propose_new_company` (solo lectura: universo SEC + verificación 10-K en EDGAR), `add_company_to_config` (**HITL 1**: editar `companies.json` con backup `.bak`) e `ingest_10k` (**HITL 2**: ingesta). HITL implementado con la primitiva nativa de LangGraph `interrupt()` dentro de cada tool de escritura y reanudación con `Command(resume=...)` (sin pausar innecesariamente tools de lectura). El LLM para ReAct se crea con `create_llm(json_mode=False)` para `tool_calls` nativos (el determinista/extractor usan `format=json`).
    - **Alta de empresas** (`company_registry.py`, sin mapas curados): universo oficial SEC cacheado (`data/sec/company_tickers.json`, TTL 30 días) + difusa `difflib`; ticker literal exacto → vía rápida sin pregunta; resto → candidatos y pregunta obligatoria al usuario antes de buscar documentos; índices/filiales sin 10-K se explican y no se dan de alta. Las listas de tickers de ingesta/retrieval/grafo se construyen desde `companies.json` + universo SEC.
 5. **Evaluación** (`evals/`): `51 Q/A` (15 viejas fuera de corpus `2023` + 36 nuevas `2024-2025` YoY `revenue/segments/risks`) y checks deterministas `answer, citas, ticker/año/sección, dense/sparse/graph, metrics_scoping` con gate `0.85` (sin LLM-juez local).
 
@@ -120,6 +122,8 @@ I want to know about nasdaq / Fluence Energy  -> (modo --react) propone alta ví
 
 La ingesta del agente usa los mismos `workers/batch` del arranque (van con el pipeline, no son propios del agente). El alta escribe `companies.json` dejando backup `companies.json.bak`.
 
+En modo `--react`, el CLI implementa **streaming en tiempo real** (`stream_mode="messages"`): anuncia dinámicamente cada herramienta al invocarse (`>> tool_name...`) y emite los tokens de respuesta en vivo, coordinándose con `Command(resume=...)` cuando salta un `interrupt()`. La arquitectura interna del CLI desacopla los comandos con una tabla de despacho (`_COMMANDS`) y un registro extensible de avisos (`INTERRUPT_HANDLERS`).
+
 Cada respuesta muestra `[Facts: N | Metrics: N | Citations: N]` (truncado a 5), citas `chunk_id/ticker/año/sección/score` y `METRICS TABLE` scoping si aplica.
 
 ### Desde Python
@@ -171,9 +175,8 @@ pip install pytest && python -m pytest tests/ -v
 
 ```
 financial-graphrag/
-├── cli.py                      # REPL agente LangGraph (HITL + memoria Q/A) + /ingest
+├── cli.py                      # REPL agente LangGraph (Streaming en vivo, Dispatch table, HITL Command(resume=...))
 ├── reprocess_missing.py        # Detecta faltantes/parciales y ingesta con workers/batch
-├── docs/                       # Tutorial local LangChain (ignorado git)
 ├── data/                       # Generado, ignorado
 │   ├── raw_10k/                # full-submission.txt + .download_cache.json
 │   ├── processed_chunks/       # chunks.json + triplets.json (PK TICKER_YEAR_metric)
@@ -182,11 +185,11 @@ financial-graphrag/
 ├── src/
 │   ├── agent/                  # Determinista + ReAct (100% local)
 │   │   ├── state.py            # AgentState (messages Q/A, no chunks)
-│   │   ├── tools.py            # ingest_10k + query_financial_rag + lookup_metrics + financial_calculator + propose_new_company + add_company_to_config
+│   │   ├── tools.py            # 6 tools ReAct + confirm_inside=True para interrupt() nativo + financial_calculator + SEC registry
 │   │   ├── company_registry.py # Universo oficial SEC + resolve difuso + verify_10k EDGAR + add_company (.bak)
 │   │   ├── nodes.py            # classify_intent with_structured_output + parallel_retrieve + fuse_rerank + generate + history
 │   │   ├── graph.py            # StateGraph determinista + MemorySaver interrupt_before ingest_tool
-│   │   └── react_graph.py      # create_react_agent (prompt EN) + MemorySaver interrupt_before tools
+│   │   └── react_graph.py      # create_react_agent (prompt EN) + MemorySaver (HITL nativo vía interrupt() en tools)
 │   ├── env.py
 │   ├── llm_factory.py          # ChatOllama qwen3:8b reasoning=False (json_mode=True → format=json; False → tool_calls nativos)
 │   ├── pipeline.py             # FinancialGraphRAGPipeline
