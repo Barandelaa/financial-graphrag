@@ -221,8 +221,57 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
         except Exception as exc:
             return f"Error add_company_to_config: {exc}"
 
+    @_tool
+    def stock_price(ticker: str) -> str:
+        """Precio actual de la acción vía Finnhub (precio, cambio, % cambio, máximo/mínimo del día, cierre previo). Úsala SIEMPRE que pregunten cuánto cotiza/valen las acciones; NUNCA des precios de memoria. Sin FINNHUB_API_KEY en .env devuelve cómo conseguirla."""
+        try:
+            from src.agent.market_data import MISSING_KEY_MSG, get_quote
+
+            try:
+                q = get_quote(ticker)
+            except RuntimeError as exc:
+                if "Finnhub" in str(exc) or "API key" in str(exc):
+                    return MISSING_KEY_MSG
+                return f"Error stock_price: {exc}"
+            if q.get("current") is None:
+                return f"Finnhub no devolvió cotización para {q['ticker']}. Verifica el ticker."
+            chg = q.get("change")
+            pct = q.get("change_pct")
+            chg_s = f"{chg:+g}" if isinstance(chg, (int, float)) else "n/d"
+            pct_s = f"{pct:+.2f}%" if isinstance(pct, (int, float)) else "n/d"
+            return (
+                f"{q['ticker']}: ${q['current']} ({chg_s} / {pct_s}). "
+                f"Día: máx ${q['day_high']} / mín ${q['day_low']}. Cierre previo: ${q['prev_close']}."
+            )
+        except Exception as exc:
+            return f"Error stock_price: {exc}"
+
+    @_tool
+    def company_news(company: str, days: int = 7) -> str:
+        """Noticias recientes de una empresa vía Finnhub (titular, fecha, fuente, URL y resumen). Úsala SIEMPRE que pidan novedades/noticias; NUNCA inventes titulares. Sin FINNHUB_API_KEY en .env devuelve cómo conseguirla."""
+        try:
+            from src.agent.market_data import MISSING_KEY_MSG, get_company_news
+
+            ticker = (company or "").strip().upper()
+            try:
+                items = get_company_news(ticker, days=days)
+            except RuntimeError as exc:
+                if "Finnhub" in str(exc) or "API key" in str(exc):
+                    return MISSING_KEY_MSG
+                return f"Error company_news: {exc}"
+            if not items:
+                return f"Sin noticias recientes para {ticker} en los últimos {days} días según Finnhub."
+            lines = [f"Noticias de {ticker} (Finnhub):"]
+            for n in items:
+                lines.append(f"- [{n['date']}] {n['headline']} ({n['source']}) — {n['url']}")
+                if n["summary"]:
+                    lines.append(f"  {n['summary']}")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Error company_news: {exc}"
+
     # Registro extensible: futuras tools (web_search...) se añaden a esta lista
-    return [query_financial_rag, lookup_metrics, financial_calculator, propose_new_company, add_company_to_config, ingest_tool]
+    return [query_financial_rag, lookup_metrics, financial_calculator, propose_new_company, add_company_to_config, ingest_tool, stock_price, company_news]
 
 
 def _dynamic_ticker_pattern() -> "re.Pattern":

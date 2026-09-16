@@ -90,6 +90,9 @@ ollama pull qwen3:8b        # DEFAULT_OLLAMA_MODEL = "qwen3:8b" (reasoning=False
 export GROQ_API_KEY="gsk_..."
 # Opcional HF_TOKEN para bge-m3
 export HF_TOKEN="hf_..."
+# Datos de mercado y noticias (tools stock_price y company_news del agente ReAct):
+# key gratuita en https://finnhub.io/register (60 llamadas/minuto)
+export FINNHUB_API_KEY="c1...x9"
 ```
 
 > `create_llm()` usa Ollama y cae a Groq. Generación/extracción requieren LLM; `dense/BM25/grafo` funcionan con índice ya construido.

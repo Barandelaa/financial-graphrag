@@ -22,3 +22,7 @@ load_dotenv(_load_env_path)
 
 def get_hf_token() -> str | None:
     return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+
+
+def get_finnhub_key() -> str | None:
+    return os.getenv("FINNHUB_API_KEY")
