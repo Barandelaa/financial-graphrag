@@ -152,13 +152,16 @@ INTERRUPT_HANDLERS: dict[str, _InterruptSpec] = {
 # --- Prints compartido ---
 
 def extract_last_answer(messages) -> str:
+    from src.agent.tools import strip_leading_json_block
+
     for m in reversed(messages or []):
         if isinstance(m, dict):
             role, content, tcs = m.get("type", ""), m.get("content", ""), m.get("tool_calls")
         else:
             role, content, tcs = getattr(m, "type", ""), getattr(m, "content", ""), getattr(m, "tool_calls", None)
         if role == "ai" and content and not tcs:
-            return content if isinstance(content, str) else str(content)
+            text = content if isinstance(content, str) else str(content)
+            return strip_leading_json_block(text)
     return ""
 
 
@@ -217,12 +220,14 @@ def run_react_turn(react_agent, question: str, thread_id: str) -> bool:
     try:
         from langchain_core.messages import AIMessageChunk, HumanMessage
         from langgraph.types import Command
+        from src.agent.tools import JsonPrefaceFilter
 
         config = {"configurable": {"thread_id": thread_id}}
         pending_input = {"messages": [HumanMessage(content=question)]}
         announced_tools: set[str] = set()
         streamed_any = False
         line_open = False
+        preface = JsonPrefaceFilter()
         for _ in range(10):  # cota anti-loops del modelo
             for msg_chunk, _metadata in react_agent.stream(
                 pending_input, config=config, stream_mode="messages"
@@ -254,8 +259,11 @@ def run_react_turn(react_agent, question: str, thread_id: str) -> bool:
                 else:
                     text = content if isinstance(content, str) else ""
                 if text:
-                    streamed_any = True
-                    line_open = _print_stream_text(text)
+                    # Retiene un posible preámbulo JSON: solo se muestra prosa.
+                    released = preface.feed(text)
+                    if released:
+                        streamed_any = True
+                        line_open = _print_stream_text(released)
             state = react_agent.get_state(config)
             pending = [i for t in state.tasks for i in (t.interrupts or [])]
             if not pending:
@@ -275,6 +283,10 @@ def run_react_turn(react_agent, question: str, thread_id: str) -> bool:
             if confirm not in ("y", "yes", "s", "si"):
                 print("Cancelado por el usuario.")
             pending_input = Command(resume=confirm)
+        tail = preface.flush()
+        if tail:
+            streamed_any = True
+            line_open = _print_stream_text(tail)
         if not streamed_any:
             # Respaldo: si no llegó ningún token (p. ej. error a mitad de stream
             # ya gestionado), muestra la última respuesta del estado.

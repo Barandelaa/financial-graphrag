@@ -75,12 +75,12 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
 
     @_tool
     def query_financial_rag(question: str) -> str:
-        """Busca en los 10-K indexados (dense BM25 grafo + rerank) y genera respuesta con citas. Úsala para CUALQUIER pregunta financiera sobre tickers/años/segmentos/métricas/riesgos. Devuelve answer + citas + metrics."""
+        """Busca en los 10-K indexados (dense BM25 grafo + rerank). Úsala para CUALQUIER pregunta sobre tickers/años: segmentos, métricas, riesgos Y COMPETIDORES (hechos COMPETES_WITH del grafo). Devuelve SOLO evidencia (hechos + tabla + citas): compón tu respuesta a partir de estos bloques."""
         try:
             result = pipeline.query(question)
-            lines = [f"ANSWER: {result.answer}", ""]
+            lines = ["EVIDENCE (compose your answer from these blocks; do not paste them verbatim):", ""]
             if result.graph_facts:
-                lines.append("GRAPH FACTS:")
+                lines.append("GRAPH FACTS (ideas de apoyo SIN chunk propio; citalas solo con un chunk_id real de CITATIONS):")
                 lines.extend(f"- {f}" for f in result.graph_facts[:20])
                 lines.append("")
             metrics = getattr(result, "metrics_rows", [])
@@ -90,7 +90,7 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
                     lines.append(f"| {m.get('ticker')} | {m.get('year')} | {m.get('metric')} | {m.get('value')} {m.get('unit','') or ''} | {m.get('metric_id')} | {m.get('chunk_id','')} |")
                 lines.append("")
             if result.citations:
-                lines.append("CITATIONS:")
+                lines.append("CITATIONS (únicos chunk_id válidos para citar; NO inventes otros ni uses relaciones como chunk):")
                 for c in result.citations[:5]:
                     lines.append(f"- {c.get('company_ticker')} | {c.get('fiscal_year')} | {c.get('section_id')} | chunk {c.get('chunk_id')}")
             # VRAM: cede a Ollama tras rerank/embeddings
@@ -225,13 +225,13 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
     def stock_price(ticker: str) -> str:
         """Precio actual de la acción vía Finnhub (precio, cambio, % cambio, máximo/mínimo del día, cierre previo). Úsala SIEMPRE que pregunten cuánto cotiza/valen las acciones; NUNCA des precios de memoria. Sin FINNHUB_API_KEY en .env devuelve cómo conseguirla."""
         try:
-            from src.agent.market_data import MISSING_KEY_MSG, get_quote
+            from src.agent.market_data import MISSING_KEY_MSG, MissingFinnhubKeyError, get_quote
 
             try:
                 q = get_quote(ticker)
+            except MissingFinnhubKeyError:
+                return MISSING_KEY_MSG
             except RuntimeError as exc:
-                if "Finnhub" in str(exc) or "API key" in str(exc):
-                    return MISSING_KEY_MSG
                 return f"Error stock_price: {exc}"
             if q.get("current") is None:
                 return f"Finnhub no devolvió cotización para {q['ticker']}. Verifica el ticker."
@@ -248,16 +248,16 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
 
     @_tool
     def company_news(company: str, days: int = 7) -> str:
-        """Noticias recientes de una empresa vía Finnhub (titular, fecha, fuente, URL y resumen). Úsala SIEMPRE que pidan novedades/noticias; NUNCA inventes titulares. Sin FINNHUB_API_KEY en .env devuelve cómo conseguirla."""
+        """Noticias recientes de una empresa vía Finnhub (titular, fecha, fuente, URL y resumen corto, ya filtradas por relevancia). Úsala SIEMPRE que pidan novedades/noticias; NUNCA inventes titulares. Lista como máximo 5-6 con resumen de UNA línea cada una. Sin FINNHUB_API_KEY en .env devuelve cómo conseguirla."""
         try:
-            from src.agent.market_data import MISSING_KEY_MSG, get_company_news
+            from src.agent.market_data import MISSING_KEY_MSG, MissingFinnhubKeyError, get_company_news
 
             ticker = (company or "").strip().upper()
             try:
                 items = get_company_news(ticker, days=days)
+            except MissingFinnhubKeyError:
+                return MISSING_KEY_MSG
             except RuntimeError as exc:
-                if "Finnhub" in str(exc) or "API key" in str(exc):
-                    return MISSING_KEY_MSG
                 return f"Error company_news: {exc}"
             if not items:
                 return f"Sin noticias recientes para {ticker} en los últimos {days} días según Finnhub."
@@ -272,6 +272,88 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
 
     # Registro extensible: futuras tools (web_search...) se añaden a esta lista
     return [query_financial_rag, lookup_metrics, financial_calculator, propose_new_company, add_company_to_config, ingest_tool, stock_price, company_news]
+
+
+def _rest_after_json_block(s: str) -> str | None:
+    """Si `s` (ya sin espacios iniciales) abre con `{`, devuelve el texto tras
+    el bloque JSON balanceado, o None si aún está incompleto (sin cerrar)."""
+    if not s.startswith("{"):
+        return s
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                # Solo lstrip: el espacio tras el bloque une con el siguiente token.
+                return s[i + 1 :].lstrip()
+    return None
+
+
+def strip_leading_json_block(text: str) -> str:
+    """Elimina un bloque JSON inicial (volcado crudo de tool) si después hay texto redactado.
+
+    Red de seguridad para modelos pequeños que pegan el resultado de la tool
+    antes de redactar. Si toda la respuesta es JSON, se deja intacta.
+    """
+    s = (text or "").lstrip()
+    rest = _rest_after_json_block(s)
+    if rest is None:
+        return text
+    return rest if len(rest) > 20 else text
+
+
+class JsonPrefaceFilter:
+    """Filtro con estado para streaming: retiene los tokens iniciales mientras
+    parezcan JSON y solo libera prosa.
+
+    En streaming no se puede "des-imprimir", así que ante un preámbulo
+    `{"answer": ...}` se contiene la salida hasta cerrar el bloque y se
+    muestra únicamente lo redactado. Uso: `feed(token)` por fragmento y
+    `flush()` al terminar el turno.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._live = False
+
+    def feed(self, token: str) -> str:
+        if self._live:
+            return token
+        self._buf += token or ""
+        if not self._buf.lstrip().startswith("{"):
+            self._live = True
+            out, self._buf = self._buf, ""
+            return out
+        rest = _rest_after_json_block(self._buf.lstrip())
+        if not rest:
+            # Bloque aún incompleto, o cerrado pero sin prosa detrás:
+            # retener (puede llegar texto redactado en tokens posteriores).
+            return ""
+        self._live = True
+        self._buf = ""
+        return rest
+
+    def flush(self) -> str:
+        if self._live:
+            out, self._buf = self._buf, ""
+            return out
+        out = strip_leading_json_block(self._buf)
+        self._buf = ""
+        self._live = True
+        return out
 
 
 def _dynamic_ticker_pattern() -> "re.Pattern":

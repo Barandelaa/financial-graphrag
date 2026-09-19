@@ -26,3 +26,20 @@ def get_hf_token() -> str | None:
 
 def get_finnhub_key() -> str | None:
     return os.getenv("FINNHUB_API_KEY")
+
+
+def refresh_env() -> None:
+    """Relee .env de disco sin sobreescribir variables ya exportadas.
+
+    Cubre el caso habitual: el .env se crea/pega la key DESPUÉS de arrancar
+    el servidor o el CLI (el load inicial ya pasó y no la vería nunca).
+    """
+    load_dotenv(_load_env_path)
+
+
+def clean_key(value: str | None) -> str | None:
+    """Limpia comillas/espacios accidentales al pegar la key en el .env."""
+    if value is None:
+        return None
+    cleaned = value.strip().strip("\"'").strip()
+    return cleaned or None

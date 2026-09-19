@@ -1,6 +1,6 @@
 # Financial GraphRAG Engine
 
-Sistema de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (las cuentas que las empresas cotizadas de EE. UU. presentan al regulador). Combina tres formas de recuperar información —**búsqueda vectorial densa, búsqueda léxica BM25 y grafo de conocimiento**— y genera respuestas con **citas a los fragmentos originales**. Con **dos agentes LangGraph** locales (`qwen3:8b`): determinista con **memoria Q/A** y **ReAct** con tools (`query_financial_rag`, `lookup_metrics`, `financial_calculator`, alta de empresas vía universo SEC), más **tabla de métricas scoping** `TICKER_YEAR`.
+Sistema de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (las cuentas que las empresas cotizadas de EE. UU. presentan al regulador). Combina tres formas de recuperar información —**búsqueda vectorial densa, búsqueda léxica BM25 y grafo de conocimiento**— y genera respuestas con **citas a los fragmentos originales**. Con **dos agentes LangGraph** locales (`qwen3:8b`): determinista con **memoria Q/A** y **ReAct** con **8 tools** (retrieval RAG, métricas scoping, calculadora financiera, alta SEC y cotizaciones/noticias en tiempo real vía Finnhub API), **servidor web FastAPI con streaming SSE e interfaz tipo ChatGPT** y tabla de métricas scoping `TICKER_YEAR`.
 
 Ejemplo de lo que responde:
 
@@ -9,31 +9,36 @@ Ejemplo de lo que responde:
 >
 > **What was AAPL revenue in 2024?**
 > *$391,035 million* — fila `| AAPL | 2024 | total net sales | 391035 USD millions | Item 8 | chunk_id |` scoping `AAPL_2024_total_net_sales`.
+>
+> **¿A cuánto cotiza NVDA y qué noticias recientes hay?**
+> *$119.10 (+2.15 / +1.84%)* con titulares recientes filtrados por relevancia y enlaces directos vía Finnhub.
 
 ## Cómo funciona
 
 ```
-SEC EDGAR 10-K (PDF/HTML)
-        │  sec-edgar-downloader
-        ▼
-Ingesta: PDF/HTML → Markdown → secciones (Item 1, 1A, 7, 8…)
-        │  chunker table-aware ~600 tokens / overlap 90 (respeta | tablas |)
-        ▼
-┌──────────────┬──────────────┬──────────────────────────┐
-│   LanceDB    │    BM25      │      Kùzu (grafo)        │
-│  (bge-m3)    │ (sparse idx) │  tripletas LLM + caché   │
-│  denso       │  léxico      │  en triplets.json        │
-└──────┬───────┴──────┬───────┴──────────┬───────────────┘
-       │              │                  │
-       └──────────────┼──────────────────┘
-                      ▼
-        Dos modos de agente (100% local, memoria Q/A: no chunks, 4 turnos, 500 chars):
-        A) Determinista: classify_intent (with_structured_output) → ingest_tool HITL | retrieve
-        B) ReAct (--react): el modelo decide tools (create_react_agent + MemorySaver)
+SEC EDGAR 10-K (PDF/HTML)             Finnhub REST API (en vivo)
+        │  sec-edgar-downloader                 │ (cotizaciones + noticias)
+        ▼                                       ▼
+Ingesta: PDF/HTML → Markdown → secciones  ┌─────────────────────────┐
+        │  chunker table-aware ~600 tok   │ stock_price, company_news│
+        ▼                                 └─────────────┬───────────┘
+┌──────────────┬──────────────┬──────────────────────────┐│
+│   LanceDB    │    BM25      │      Kùzu (grafo)        ││
+│  (bge-m3)    │ (sparse idx) │  tripletas LLM + caché   ││
+│  denso       │  léxico      │  en triplets.json        ││
+└──────┬───────┴──────┬───────┴──────────┬───────────────┘│
+       │              │                  │                │
+       └──────────────┼──────────────────┘                │
+                      ▼                                   │
+        Dos modos de agente (100% local, memoria Q/A):    │
+        A) Determinista: classify_intent → ingest_tool HITL | retrieve
+        B) ReAct (--react y web API): el modelo decide tools
            tools: query_financial_rag | lookup_metrics | financial_calculator
                   propose_new_company | add_company_to_config (HITL 1) | ingest_10k (HITL 2)
+                  stock_price | company_news (tiempo real)
            HITL moderno nativo con interrupt() dentro de las tools y reanudación con Command(resume=...)
-           CLI con streaming token a token en tiempo real (stream_mode="messages") y anuncio dinámico de tools
+           Filtro de preámbulo JSON en streaming (JsonPrefaceFilter)
+           Canales: CLI interactivo y Servidor Web FastAPI (SSE + historial en disco)
         retrieve: expanded query (revenue→net sales) → dense/sparse/graph+metrics_table scoping
         RRF (k=60) → grounding por ticker → dedup
                     → reranker cross-encoder (bge-reranker-v2-m3)
@@ -50,7 +55,7 @@ Ingesta: PDF/HTML → Markdown → secciones (Item 1, 1A, 7, 8…)
 3. **Recuperación** (`src/retrieval/`): cada pregunta pasa por `expand_query` sinónimos, consulta los tres índices en paralelo + `MetricsTable` scoping (`c.ticker IN $tickers AND m.id CONTAINS '_'`), fusiona con **RRF**, filtra por ticker, dedup, reordena con **cross-encoder** y genera con **citas** (`CHUNK_ID` + `METRICS TABLE` con `section`).
 4. **Agentes** (`src/agent/`):
    - **Determinista**: `StateGraph` `classify_intent (with_structured_output IntentOutput ingest|retrieve) → parallel_retrieve → fuse_rerank (torch.cuda.empty_cache) → generate`. `ingest_10k(ticker,year)` con **HITL** `MemorySaver interrupt_before ingest_tool` y confirmación `y/n` en CLI. Memoria conversacional solo `Q/A` (no chunks, `4×500 chars`).
-   - **ReAct** (`--react`, `react_graph.py`, system prompt en inglés para `qwen3:8b`): `create_react_agent` con 6 tools — `query_financial_rag` (retrieval completo), `lookup_metrics` (cifras scoping), `financial_calculator` (`yoy_pct|pct_change|diff|ratio|sum|avg`, siempre con cifras de tools y mostrando `FORMULA`), `propose_new_company` (solo lectura: universo SEC + verificación 10-K en EDGAR), `add_company_to_config` (**HITL 1**: editar `companies.json` con backup `.bak`) e `ingest_10k` (**HITL 2**: ingesta). HITL implementado con la primitiva nativa de LangGraph `interrupt()` dentro de cada tool de escritura y reanudación con `Command(resume=...)` (sin pausar innecesariamente tools de lectura). El LLM para ReAct se crea con `create_llm(json_mode=False)` para `tool_calls` nativos (el determinista/extractor usan `format=json`).
+   - **ReAct** (`--react`, `react_graph.py`, system prompt en inglés para `qwen3:8b`): `create_react_agent` con **8 tools** — `query_financial_rag` (retrieval completo), `lookup_metrics` (cifras scoping), `financial_calculator` (`yoy_pct|pct_change|diff|ratio|sum|avg`, siempre con cifras de tools y mostrando `FORMULA`), `propose_new_company` (solo lectura: universo SEC + verificación 10-K en EDGAR), `add_company_to_config` (**HITL 1**: editar `companies.json` con backup `.bak`), `ingest_10k` (**HITL 2**: ingesta), `stock_price` (cotización en tiempo real vía Finnhub API) y `company_news` (noticias recientes con filtro de relevancia SEC y resolución de enlaces directos). HITL implementado con la primitiva nativa de LangGraph `interrupt()` dentro de cada tool de escritura y reanudación con `Command(resume=...)`. El LLM para ReAct se crea con `create_llm(json_mode=False)` para `tool_calls` nativos (el determinista/extractor usan `format=json`).
    - **Alta de empresas** (`company_registry.py`, sin mapas curados): universo oficial SEC cacheado (`data/sec/company_tickers.json`, TTL 30 días) + difusa `difflib`; ticker literal exacto → vía rápida sin pregunta; resto → candidatos y pregunta obligatoria al usuario antes de buscar documentos; índices/filiales sin 10-K se explican y no se dan de alta. Las listas de tickers de ingesta/retrieval/grafo se construyen desde `companies.json` + universo SEC.
 5. **Evaluación** (`evals/`): `51 Q/A` (15 viejas fuera de corpus `2023` + 36 nuevas `2024-2025` YoY `revenue/segments/risks`) y checks deterministas `answer, citas, ticker/año/sección, dense/sparse/graph, metrics_scoping` con gate `0.85` (sin LLM-juez local).
 
@@ -129,6 +134,35 @@ En modo `--react`, el CLI implementa **streaming en tiempo real** (`stream_mode=
 
 Cada respuesta muestra `[Facts: N | Metrics: N | Citations: N]` (truncado a 5), citas `chunk_id/ticker/año/sección/score` y `METRICS TABLE` scoping si aplica.
 
+### API web local (FastAPI + página mínima, agente ReAct con streaming)
+
+```bash
+.venv/Scripts/python.exe -m pip install -r requirements.txt  # fastapi + uvicorn[standard]
+.venv/Scripts/python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
+# Abrir http://localhost:8000
+```
+
+Sin `--reload` a propósito: recargar duplicaría el modelo en VRAM. Un solo pipeline/agente compartidos (`GRAPH_WORKERS=2` opcional, por defecto 2); Kuzu es un solo escritor y los turnos se serializan con lock.
+
+Endpoints (`api.py`):
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| `GET` | `/health` | `{status, model, tickers}` |
+| `GET` | `/` | Chat SPA (`static/index.html`): sidebar de chats, tokens en vivo, insignias `>> tool...`, tarjetas HITL |
+| `POST` | `/query {question, thread_id?}` | SSE (`start` / `token` / `tool` / `interrupt` / `done` / `error`) con el bucle ReAct del CLI |
+| `POST` | `/confirm {thread_id, decision}` | Reanuda con `Command(resume=...)` tras un `interrupt` (`confirm_add_company`, `confirm_ingest`) |
+| `GET` | `/conversations` | Lista conversaciones guardadas en `data/conversations.json` ordenadas por fecha |
+| `GET` | `/conversations/{thread_id}` | Obtiene el historial completo de mensajes y título de un thread |
+| `DELETE` | `/conversations/{thread_id}` | Elimina una conversación del almacenamiento |
+
+Las conversaciones se persisten en disco de forma atómica y segura entre hilos (`data/conversations.json`). Al reiniciar el servidor API, el historial se reinyecta automáticamente en el `MemorySaver` de LangGraph para no perder el contexto conversacional.
+
+```bash
+curl -N -X POST localhost:8000/query -H "Content-Type: application/json" -d "{\"question\":\"¿a cuánto cotiza AAPL?\"}"
+curl -X POST localhost:8000/confirm -H "Content-Type: application/json" -d "{\"thread_id\":\"...\",\"decision\":\"y\"}"
+```
+
 ### Desde Python
 
 ```python
@@ -149,7 +183,7 @@ from src.agent.graph import build_agent_graph
 agent = build_agent_graph(pipeline)
 agent.invoke({"question": "What was AAPL revenue in 2024?"}, config={"configurable":{"thread_id":"t1"}})
 
-# Agente ReAct (tools + doble HITL)
+# Agente ReAct (8 tools + doble HITL)
 from src.agent.react_graph import build_react_agent
 from langchain_core.messages import HumanMessage
 react = build_react_agent(pipeline)  # usa create_llm(json_mode=False) para tool_calls
@@ -178,22 +212,29 @@ pip install pytest && python -m pytest tests/ -v
 
 ```
 financial-graphrag/
+├── api.py                      # Servidor FastAPI (SSE streaming, HITL wait/resume, CRUD historial)
 ├── cli.py                      # REPL agente LangGraph (Streaming en vivo, Dispatch table, HITL Command(resume=...))
 ├── reprocess_missing.py        # Detecta faltantes/parciales y ingesta con workers/batch
-├── data/                       # Generado, ignorado
-│   ├── raw_10k/                # full-submission.txt + .download_cache.json
-│   ├── processed_chunks/       # chunks.json + triplets.json (PK TICKER_YEAR_metric)
-│   ├── vector_store/lancedb/   # LanceDB bge-m3
-│   └── graph/kuzu_db/          # Kuzu
+├── static/
+│   └── index.html              # Frontend Web SPA (ChatGPT-style, SSE, historial, tarjetas HITL)
+├── data/                       # Datos y persistencia
+│   ├── companies.json          # Registro de empresas seguidas (con .bak automático)
+│   ├── conversations.json      # Historial persistente de chats (atómico / thread-safe)
+│   ├── raw_10k/                # full-submission.txt + .download_cache.json (ignorado)
+│   ├── processed_chunks/       # chunks.json + triplets.json (PK TICKER_YEAR_metric, ignorado)
+│   ├── vector_store/lancedb/   # LanceDB bge-m3 (ignorado)
+│   └── graph/kuzu_db/          # Kuzu DB (ignorado)
 ├── src/
 │   ├── agent/                  # Determinista + ReAct (100% local)
 │   │   ├── state.py            # AgentState (messages Q/A, no chunks)
-│   │   ├── tools.py            # 6 tools ReAct + confirm_inside=True para interrupt() nativo + financial_calculator + SEC registry
+│   │   ├── tools.py            # 8 tools ReAct + interrupt() nativo + financial_calculator + SEC registry + Finnhub
+│   │   ├── market_data.py      # Cliente Finnhub (cotizaciones, noticias, resolución URLs, caché 60s)
+│   │   ├── history_store.py    # Persistencia JSON atómica de conversaciones + reinyección en LangGraph
 │   │   ├── company_registry.py # Universo oficial SEC + resolve difuso + verify_10k EDGAR + add_company (.bak)
 │   │   ├── nodes.py            # classify_intent with_structured_output + parallel_retrieve + fuse_rerank + generate + history
 │   │   ├── graph.py            # StateGraph determinista + MemorySaver interrupt_before ingest_tool
 │   │   └── react_graph.py      # create_react_agent (prompt EN) + MemorySaver (HITL nativo vía interrupt() en tools)
-│   ├── env.py
+│   ├── env.py                  # Carga de variables de entorno (.env)
 │   ├── llm_factory.py          # ChatOllama qwen3:8b reasoning=False (json_mode=True → format=json; False → tool_calls nativos)
 │   ├── pipeline.py             # FinancialGraphRAGPipeline
 │   ├── ingestion/              # downloader, parser (HTML tables → | |), chunker table-aware, pipeline
@@ -242,6 +283,8 @@ Notas:
 | Grafo | Kùzu (MERGE scoping) |
 | LLM | Ollama `qwen3:8b` `reasoning=False, num_ctx 8192` (`format=json` en determinista/extractor; `tool_calls` nativos en ReAct) → Groq fallback |
 | Framework | LangChain / LangGraph (StateGraph determinista + ReAct `create_react_agent`, ToolNode HITL) |
+| Web API & UI | FastAPI, Uvicorn, Server-Sent Events (SSE), HTML5/Tailwind/CSS |
+| APIs Externas | Finnhub REST API (cotizaciones en tiempo real, noticias financieras) |
 | Reranker | BAAI/bge-reranker-v2-m3 |
 | Comunidades | Leiden + igraph + networkx |
 | Evaluación | Checks deterministas gate 0.85 + metrics_scoping (`evals/run_checks.py`) |
