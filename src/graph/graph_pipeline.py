@@ -21,6 +21,7 @@ from src.graph.extractor import (
 )
 from src.graph.schema import GraphConfig, GraphSchema
 from src.ingestion.chunker import Chunk
+from src.agent.progress import IngestCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -271,11 +272,20 @@ class GraphPipeline:
                 (chunk.company_ticker, chunk.fiscal_year), []
             ).append(chunk)
 
+        from src.agent.progress import cancel_requested
+
         for (ticker, year), group_chunks in groups.items():
+            if cancel_requested():
+                raise IngestCancelled()
             cache = self._load_triplets_cache(ticker, year)
             pending: List[Chunk] = []
-            # 1) upsert inmediatemente los cacheados (rápido, sin LLM)
-            for chunk in group_chunks:
+            # 1) upsert inmediatemente los cacheados (rápido, sin LLM).
+            # También reporta progreso: al retomar, este bucle es la mayor
+            # parte del trabajo visible y si no, la barra se quedaría a cero.
+            from src.agent.progress import report_current
+
+            reused = 0
+            for idx, chunk in enumerate(group_chunks, start=1):
                 if chunk.chunk_id in cache:
                     triplets = cache[chunk.chunk_id]
                     logger.debug(
@@ -286,10 +296,15 @@ class GraphPipeline:
                     self._upsert_chunk(conn, chunk)
                     self._upsert_triplets(conn, chunk, triplets)
                     all_triplets.extend(triplets)
+                    reused += 1
+                    if reused % 10 == 0 or idx == len(group_chunks):
+                        report_current(ticker=ticker, year=year, phase="cache",
+                                       done=reused, total=len(group_chunks))
                 else:
                     pending.append(chunk)
 
             if not pending:
+                report_current(ticker=ticker, year=year, phase="done", done=len(group_chunks), total=len(group_chunks))
                 logger.info("Graph pipeline: all %d chunks cached for %s / %s", len(group_chunks), ticker, year)
                 try:
                     conn.execute("CHECKPOINT")
@@ -305,6 +320,7 @@ class GraphPipeline:
                 self.batch_size,
                 self.max_workers,
             )
+            report_current(ticker=ticker, year=year, phase="extract", done=reused, total=len(group_chunks))
             t0 = time.time()
             # 2) Agrupa pendientes en lotes
             batches: List[List[Chunk]] = [
@@ -355,6 +371,15 @@ class GraphPipeline:
                             # si no estaba en result_map y era skippable, extractor ya lo maneja
 
                         completed_batches += 1
+                        if cancel_requested():
+                            for f in future_to_batch:
+                                f.cancel()
+                            # Guarda lo avanzado antes de abortar para retomar después
+                            cache.update(new_entries)
+                            self._save_triplets_cache(ticker, year, cache)
+                            raise IngestCancelled()
+                        done_chunks = reused + min(completed_batches * self.batch_size, len(pending))
+                        report_current(ticker=ticker, year=year, phase="extract", done=done_chunks, total=len(group_chunks))
                         # Guardado incremental cada save_every batches + siempre al final
                         if completed_batches % self.save_every == 0:
                             cache.update(new_entries)
@@ -385,6 +410,12 @@ class GraphPipeline:
                         all_triplets.extend(triplets)
                         new_entries[cid] = triplets
                     completed_batches += 1
+                    if cancel_requested():
+                        cache.update(new_entries)
+                        self._save_triplets_cache(ticker, year, cache)
+                        raise IngestCancelled()
+                    done_chunks = reused + min(completed_batches * self.batch_size, len(pending))
+                    report_current(ticker=ticker, year=year, phase="extract", done=done_chunks, total=len(group_chunks))
                     if completed_batches % self.save_every == 0:
                         cache.update(new_entries)
                         self._save_triplets_cache(ticker, year, cache)
@@ -393,6 +424,7 @@ class GraphPipeline:
             if new_entries:
                 cache.update(new_entries)
                 self._save_triplets_cache(ticker, year, cache)
+            report_current(ticker=ticker, year=year, phase="done", done=len(group_chunks), total=len(group_chunks))
 
             elapsed = time.time() - t0
             avg_ms = (elapsed / max(1, len(pending))) * 1000

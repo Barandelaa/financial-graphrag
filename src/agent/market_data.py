@@ -84,6 +84,70 @@ def _finnhub_symbol(ticker: str) -> str:
     return t
 
 
+def get_peers(ticker: str) -> list[str]:
+    """Peers del mismo sector/industria vía Finnhub (/stock/peers).
+
+    Fuente opcional: sin key o con error devuelve lista vacía silenciosa
+    (no bloquea al llamador, que combina con otras fuentes).
+    """
+    symbol = _finnhub_symbol(ticker)
+
+    def _load():
+        data = _get("/stock/peers", {"symbol": symbol})
+        items = data.get("result", [])
+        if not isinstance(items, list):
+            return []
+        return [str(t).upper() for t in items if str(t).strip()]
+
+    try:
+        return _cached(("peers", symbol), _load)
+    except Exception as exc:
+        logger.debug("get_peers(%s) omitido: %s", symbol, exc)
+        return []
+
+
+def _fmt_cap(value) -> str:
+    """Finnhub devuelve marketCapitalization en MILLONES de USD: se escala."""
+    try:
+        v = float(value) * 1e6
+    except (TypeError, ValueError):
+        return ""
+    if v >= 1e12:
+        return f"${v / 1e12:.2f}T"
+    if v >= 1e9:
+        return f"${v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.0f}M"
+    return f"${v:g}" if v else ""
+
+
+def get_company_profile(ticker: str) -> dict:
+    """Perfil Finnhub (/stock/profile2): nombre, industria, market cap, web.
+
+    Fuente opcional: sin key o con error devuelve dict vacío (el llamador
+    sigue con nombre legal SEC + evidencia EDGAR).
+    """
+    symbol = _finnhub_symbol(ticker)
+
+    def _load():
+        data = _get("/stock/profile2", {"symbol": symbol})
+        return data if isinstance(data, dict) else {}
+
+    try:
+        d = _cached(("profile", symbol), _load)
+    except Exception as exc:
+        logger.debug("get_company_profile(%s) omitido: %s", symbol, exc)
+        return {}
+    industry = d.get("finnhubIndustry") or d.get("industry") or ""
+    return {
+        "name": d.get("name", ""),
+        "exchange": d.get("exchange", ""),
+        "industry": industry,
+        "cap": _fmt_cap(d.get("marketCapitalization")),
+        "web": d.get("weburl", ""),
+    }
+
+
 def get_quote(ticker: str) -> dict:
     """Cotización actual: precio, cambio, % cambio, máximo/mínimo del día y cierre previo."""
     symbol = _finnhub_symbol(ticker)

@@ -48,6 +48,9 @@ class IngestionPipeline:
         use_cache: bool = True,
     ) -> List[Chunk]:
         logger.info("Ingestion pipeline started for %s / %s", ticker, year)
+        from src.agent.progress import report_current
+
+        report_current(ticker=ticker, year=year, phase="download", done=0, total=1)
 
         if use_cache:
             cached = self._load_cached_chunks(ticker, year)
@@ -66,9 +69,14 @@ class IngestionPipeline:
             logger.warning("No files downloaded for %s / %s", ticker, year)
             return []
 
+        from src.agent.progress import IngestCancelled, cancel_requested
+
         all_chunks: List[Chunk] = []
-        for file_path in files:
+        for idx, file_path in enumerate(files, start=1):
+            if cancel_requested():
+                raise IngestCancelled()
             try:
+                report_current(ticker=ticker, year=year, phase="parse", done=idx, total=len(files))
                 raw_text = self.parser.extract_text(file_path)
                 md_text = self.parser.convert_to_markdown(raw_text)
                 sections = self.parser.extract_sections(md_text, ticker, year)
@@ -81,6 +89,7 @@ class IngestionPipeline:
                 continue
 
         self._persist_chunks(all_chunks, ticker, year)
+        report_current(ticker=ticker, year=year, phase="chunks", done=len(all_chunks), total=len(all_chunks))
         logger.info(
             "Ingestion pipeline completed for %s / %s: %d chunks",
             ticker,

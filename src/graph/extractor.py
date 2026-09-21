@@ -204,6 +204,10 @@ class TripletExtractor:
         section_id: str,
         chunk_id: str,
     ) -> List[FinancialTriplet]:
+        from src.agent.progress import IngestCancelled, cancel_requested
+
+        if cancel_requested():
+            raise IngestCancelled()
         if _is_skippable_chunk(chunk_text, section_id):
             logger.debug("Skipping boilerplate chunk %s (section=%s)", chunk_id, section_id)
             return []
@@ -215,6 +219,8 @@ class TripletExtractor:
         }
         last_error: Optional[Exception] = None
         for attempt in range(1 + self.max_retries + 1):
+            if cancel_requested():
+                raise IngestCancelled()
             try:
                 raw = self._invoke_single_json(payload)
                 raw = self._enrich_metric_year_fallback(raw, chunk_text, year)
@@ -230,6 +236,8 @@ class TripletExtractor:
                     for t in parsed
                 ]
             except Exception as exc:
+                if cancel_requested():
+                    raise IngestCancelled()
                 last_error = exc
                 if attempt <= self.max_retries:
                     delay = min(self.base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.5), self.max_delay)
@@ -271,6 +279,11 @@ class TripletExtractor:
         Retorna dict chunk_id -> List[FinancialTriplet]. En fallo total, cae
         a extracción single-chunk por elemento.
         """
+        from src.agent.progress import IngestCancelled, cancel_requested
+
+        if cancel_requested():
+            raise IngestCancelled()
+
         # Separa skippables sin LLM
         skippable_ids: set[str] = set()
         active: List[dict] = []
@@ -317,6 +330,8 @@ class TripletExtractor:
         # Batch es inestable en qwen3; solo 1 reintento, luego fallback inmediato a per-chunk
         batch_retries = min(self.max_retries, 1)
         for attempt in range(1 + batch_retries + 1):
+            if cancel_requested():
+                raise IngestCancelled()
             try:
                 raw_by_id = self._invoke_batch_json(payload)
                 # Enrich year fallback por chunk antes de parsear

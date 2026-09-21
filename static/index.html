@@ -67,6 +67,11 @@
   .typing span:nth-child(2) { animation-delay: .2s; }
   .typing span:nth-child(3) { animation-delay: .4s; }
   @keyframes blink { 40% { opacity: .25; } }
+  .pbar { margin: .5rem 0; font-size: .82rem; color: #333; }
+  .pbar .label { margin-bottom: .25rem; font-weight: 500; }
+  .pbar .track { background: #e0e0e0; border-radius: 6px; height: 10px; overflow: hidden; }
+  .pbar .fill { background: var(--accent); height: 100%; width: 0%; transition: width .3s ease; border-radius: 6px; }
+  .pbar.done .fill { background: #2e7d32; }
   .hitl { background: var(--hitl-bg); border: 1px solid var(--hitl-border); border-radius: 10px; padding: .7rem .9rem; font-size: .85rem; max-width: 90%; }
   .hitl .btns { margin-top: .5rem; display: flex; gap: .5rem; }
   .hitl button { border-radius: 8px; padding: .4rem 1rem; cursor: pointer; font-size: .85rem; }
@@ -88,6 +93,8 @@
   #send { width: 38px; height: 38px; border-radius: 50%; border: none; background: var(--accent); color: #fff; font-size: 1.1rem; cursor: pointer; }
   #send:hover { background: var(--accent-dark); }
   #send:disabled { background: #bdbdbd; cursor: default; }
+  #stop { width: 38px; height: 38px; border-radius: 50%; border: 1px solid #c62828; background: #fff; color: #c62828; font-size: .95rem; cursor: pointer; }
+  #stop:disabled { color: #bdbdbd; border-color: #ddd; cursor: default; }
   @media (max-width: 700px) { #sidebar { display: none; } }
 </style>
 </head>
@@ -105,6 +112,7 @@
     <div id="box">
       <input id="q" placeholder="Pregunta lo que sea..." autocomplete="off">
       <button id="send" onclick="ask()" title="Enviar">↑</button>
+      <button id="stop" onclick="stopTurn()" title="Detener turno en curso" disabled>■</button>
     </div>
   </div>
 </main>
@@ -114,7 +122,35 @@ let busy = false;
 const log = document.getElementById('log');
 const input = document.getElementById('q');
 const sendBtn = document.getElementById('send');
+const stopBtn = document.getElementById('stop');
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) ask(); });
+async function stopTurn() {
+  if (!busy || !thread_id) return;
+  stopBtn.disabled = true;
+  try {
+    const res = await fetch('/cancel', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({thread_id})
+    });
+    if (!res.ok) {
+      // p. ej. 404 = servidor viejo sin endpoint /cancel: avisar en vez de fallar en silencio
+      const d = document.createElement('div');
+      d.className = 'error';
+      d.textContent = `No se pudo detener (HTTP ${res.status}). Probablemente el servidor ejecuta código antiguo: reinícialo con el comando del README.`;
+      log.appendChild(d);
+      log.scrollTop = log.scrollHeight;
+      stopBtn.disabled = false;
+    }
+  } catch (err) {
+    const d = document.createElement('div');
+    d.className = 'error';
+    d.textContent = 'No se pudo contactar al servidor: ' + err.message;
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+    stopBtn.disabled = false;
+  }
+}
 
 /* ---------- conversaciones (servidor, persistentes en disco) ---------- */
 async function fetchConvs() {
@@ -253,6 +289,60 @@ function addAgent() {
       el.classList.toggle('running', !!running);
       el.classList.toggle('done', !running);
     },
+    progress(p) {
+      // Una barra por año: ticker + year como clave.
+      const key = (p.ticker || '?') + '_' + (p.year || '?');
+      let el = this.steps.querySelector(`[data-pbar="${CSS.escape(key)}"]`);
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'pbar';
+        el.dataset.pbar = key;
+        el.innerHTML = '<div class="label"></div><div class="track"><div class="fill"></div></div>';
+        this.steps.appendChild(el);
+      }
+      const total = Math.max(1, p.total || 1), done = Math.min(p.done || 0, total);
+      const phaseTxt = {
+        download: 'descargando 10-K',
+        parse: 'analizando filing',
+        chunks: 'chunks listos',
+        cache: 'comprobando caché',
+        extract: 'extrayendo tripletas',
+        index: 'indexando grafo y vectores',
+        done: 'completado'
+      }[p.phase] || p.phase || '';
+
+      let pct = 0;
+      if (p.phase === 'download') {
+        pct = 5;
+      } else if (p.phase === 'parse') {
+        pct = 5 + Math.round(10 * done / total);
+      } else if (p.phase === 'chunks') {
+        pct = 15;
+      } else if (p.phase === 'cache') {
+        pct = 15 + Math.round(15 * done / total);
+      } else if (p.phase === 'extract') {
+        pct = 20 + Math.round(75 * done / total);
+      } else if (p.phase === 'index') {
+        pct = 95 + Math.round(4 * done / total);
+      } else if (p.phase === 'done') {
+        pct = 100;
+      } else {
+        pct = Math.round(100 * done / total);
+      }
+      pct = Math.max(0, Math.min(100, pct));
+
+      const isDone = p.phase === 'done' || pct >= 100;
+      let countTxt = '';
+      if (p.phase === 'extract' || p.phase === 'cache') {
+        countTxt = ` · ${done}/${total}`;
+      } else if (p.phase === 'chunks' || p.phase === 'done') {
+        countTxt = ` · ${total} chunks`;
+      }
+      el.querySelector('.label').textContent = `${p.ticker || ''} ${p.year || ''} · ${phaseTxt}${countTxt} (${pct}%)`;
+      el.querySelector('.fill').style.width = pct + '%';
+      el.classList.toggle('done', isDone);
+      log.scrollTop = log.scrollHeight;
+    },
     typing(on) {
       let el = this.bubble.querySelector('.typing');
       if (on && !el) {
@@ -265,7 +355,7 @@ function addAgent() {
     }
   };
 }
-function addHitl(notice, question) {
+function addHitl(notice, question, parentEl = null) {
   const d = document.createElement('div');
   d.className = 'hitl';
   const p = document.createElement('div');
@@ -278,11 +368,20 @@ function addHitl(notice, question) {
   no.className = 'no'; no.textContent = 'Cancelar';
   btns.appendChild(yes); btns.appendChild(no);
   d.appendChild(p); d.appendChild(btns);
-  log.appendChild(d);
+  (parentEl || log).appendChild(d);
   log.scrollTop = log.scrollHeight;
   return new Promise(resolve => {
-    yes.onclick = () => { yes.disabled = no.disabled = true; resolve(true); };
-    no.onclick = () => { yes.disabled = no.disabled = true; resolve(false); };
+    const settle = (value, label) => {
+      btns.remove();
+      const note = document.createElement('div');
+      note.style.cssText = 'font-size:.8rem;color:#555;margin-top:.35rem;';
+      note.textContent = label;
+      d.appendChild(note);
+      log.scrollTop = log.scrollHeight;
+      resolve(value);
+    };
+    yes.onclick = () => settle(true, '(confirmado, ejecutando...)');
+    no.onclick = () => settle(false, '(cancelado)');
   });
 }
 
@@ -290,7 +389,7 @@ function addHitl(notice, question) {
 async function ask() {
   const question = input.value.trim();
   if (!question || busy) return;
-  busy = true; sendBtn.disabled = true;
+  busy = true; sendBtn.disabled = true; stopBtn.disabled = false;
   input.value = '';
   if (document.getElementById('hero')) log.innerHTML = '';
   addUser(question);
@@ -320,9 +419,10 @@ async function ask() {
         if (ev === 'start') { thread_id = data.thread_id; renderSidebar(); }
         else if (ev === 'token') { agent.typing(false); agent.append(data.text); }
         else if (ev === 'tool') { agent.tool(data.name, true); }
+        else if (ev === 'progress') { agent.typing(false); agent.progress(data); }
         else if (ev === 'interrupt') {
           agent.typing(false);
-          const ok = await addHitl(data.notice, data.question).then(v => v);
+          const ok = await addHitl(data.notice, data.question, agent.steps).then(v => v);
           // marca el step como resuelto y confirma en el backend
           agent.tool('confirm', false);
           await fetch('/confirm', {
@@ -330,24 +430,36 @@ async function ask() {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({thread_id, decision: ok ? 'y' : 'n'})
           });
-          const note = document.createElement('div');
-          note.className = 'hitl';
-          note.textContent = ok ? '(confirmado, ejecutando...)' : '(cancelado)';
-          log.appendChild(note);
         }
         else if (ev === 'done') {
           agent.typing(false);
           for (const el of agent.steps.querySelectorAll('.step')) { el.classList.remove('running'); el.classList.add('done'); }
+          for (const el of agent.steps.querySelectorAll('.pbar')) {
+            el.classList.add('done');
+            const fill = el.querySelector('.fill');
+            if (fill) fill.style.width = '100%';
+          }
           renderSidebar();
         }
         else if (ev === 'error') { agent.typing(false); agent.append('\n**ERROR:** ' + data.message); }
+        else if (ev === 'cancelled') {
+          agent.typing(false);
+          for (const el of agent.steps.querySelectorAll('.step')) { el.classList.remove('running'); el.classList.add('done'); }
+          for (const el of agent.steps.querySelectorAll('.pbar')) {
+            const fill = el.querySelector('.fill');
+            if (fill) fill.style.background = '#e65100';
+            const lbl = el.querySelector('.label');
+            if (lbl && !lbl.textContent.includes('pausado')) lbl.textContent += ' · pausado (guardado)';
+          }
+          agent.append('\n*(detenido por el usuario — progreso guardado: pide "continúa la ingesta" para retomar)*');
+        }
       }
     }
   } catch (err) {
     agent.typing(false);
     agent.append('\n**ERROR de conexión:** ' + err.message);
   }
-  busy = false; sendBtn.disabled = false;
+  busy = false; sendBtn.disabled = false; stopBtn.disabled = true;
   input.focus();
 }
 

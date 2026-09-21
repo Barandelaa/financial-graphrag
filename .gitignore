@@ -34,6 +34,9 @@ Thumbs.db
 # === Tutorial local (no subir) ===
 docs/
 
+# === Logs de ingestas en foreground ===
+logs/
+
 # === Caches de librerías locales ===
 .pytest_cache/
 .mypy_cache/

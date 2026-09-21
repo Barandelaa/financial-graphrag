@@ -41,17 +41,35 @@ class ConfirmIn(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import os
+
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    )
     load_env()
     from cli import build_pipeline, build_react
 
     workers = 2
     try:
-        import os
-
         workers = int(os.getenv("GRAPH_WORKERS", "2"))
     except ValueError:
         pass
-    logger.info("API: construyendo pipeline (workers=%d)...", workers)
+    import sys
+
+    try:
+        from datetime import datetime
+
+        code_ts = datetime.fromtimestamp(os.path.getmtime(__file__)).strftime("%H:%M:%S")
+    except Exception:
+        code_ts = "?"
+    logger.info(
+        "API: pid=%d exe=%s api.py=%s — construyendo pipeline (workers=%d)...",
+        os.getpid(),
+        sys.executable,
+        code_ts,
+        workers,
+    )
     pipeline = build_pipeline(max_workers=workers, batch_size=1)
     agent = build_react(pipeline)
     app.state.pipeline = pipeline
@@ -125,6 +143,63 @@ def _ensure_memory(agent, thread_id: str) -> None:
         logger.warning("No se pudo reinyectar memoria: %s", exc)
 
 
+def _repair_dangling_tool_calls(agent, thread_id: str) -> None:
+    """Si un turno previo se canceló o falló abruptamente dejando un AIMessage con
+    tool_calls sin su ToolMessage correspondiente, inyecta ToolMessages sintéticos de
+    cancelación para que LangGraph valide el historial sin lanzar ValueError
+    (INVALID_CHAT_HISTORY)."""
+    from langchain_core.messages import ToolMessage
+
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = agent.get_state(config)
+        msgs = state.values.get("messages", []) if isinstance(state.values, dict) else []
+        if not msgs:
+            return
+
+        tool_call_ids: dict[str, str] = {}  # id -> name
+        resolved_ids: set[str] = set()
+        for m in msgs:
+            tcs = getattr(m, "tool_calls", None) or []
+            for tc in tcs:
+                if isinstance(tc, dict):
+                    t_id = tc.get("id")
+                    t_name = tc.get("name", "tool")
+                else:
+                    t_id = getattr(tc, "id", None)
+                    t_name = getattr(tc, "name", "tool")
+                if t_id:
+                    tool_call_ids[t_id] = t_name
+            chunk_type = getattr(m, "type", "")
+            if isinstance(m, ToolMessage) or chunk_type == "tool":
+                tc_id = getattr(m, "tool_call_id", None)
+                if tc_id:
+                    resolved_ids.add(tc_id)
+
+        missing_ids = {k: v for k, v in tool_call_ids.items() if k not in resolved_ids}
+        if not missing_ids:
+            return
+
+        logger.info(
+            "Reparando %d tool_calls huérfanos en thread %s: %s",
+            len(missing_ids),
+            thread_id[:8],
+            list(missing_ids.keys()),
+        )
+        repairs = [
+            ToolMessage(
+                content="Operación detenida por el usuario. Progreso guardado.",
+                tool_call_id=tc_id,
+                name=tc_name,
+            )
+            for tc_id, tc_name in missing_ids.items()
+        ]
+        agent.update_state(config, {"messages": repairs})
+        logger.info("Historial de chat reparado con éxito para thread %s", thread_id[:8])
+    except Exception as exc:
+        logger.warning("No se pudo revisar/reparar tool_calls huérfanos: %s", exc)
+
+
 def _react_turn_events(agent, question: str, thread_id: str, emit) -> None:
     """Ejecuta un turno ReAct emitiendo eventos. Corre en worker thread."""
     from langchain_core.messages import HumanMessage
@@ -135,6 +210,9 @@ def _react_turn_events(agent, question: str, thread_id: str, emit) -> None:
     from src.agent import history_store
     from src.agent.tools import JsonPrefaceFilter
 
+    from src.agent import progress as _progress
+
+    _progress.set_current_thread(thread_id)
     config = {"configurable": {"thread_id": thread_id}}
     pending_input = {"messages": [HumanMessage(content=question)]}
     announced: set[str] = set()
@@ -180,6 +258,7 @@ def _react_turn_events(agent, question: str, thread_id: str, emit) -> None:
         box["event"].wait(timeout=600)
         decision = RESUME.pop(thread_id, {}).get("decision")
         if decision is None:
+            _progress.clear(thread_id)
             emit("error", {"message": "Confirmación caducada (timeout). Turno cancelado."})
             return
         pending_input = Command(resume=decision)
@@ -190,6 +269,7 @@ def _react_turn_events(agent, question: str, thread_id: str, emit) -> None:
 
     answer = "".join(full_text)
     history_store.append_turn(thread_id, question, answer)
+    _progress.clear(thread_id)
     emit("done", {"answer": answer, "thread_id": thread_id})
 
 
@@ -211,14 +291,28 @@ async def query(body: QueryIn):
     q: queue.Queue = queue.Queue()
 
     def _worker():
+        from src.agent import progress as _progress
+
+        listener = lambda data: q.put(("progress", data))
+        _progress.subscribe(thread_id, listener)
         with GRAPH_LOCK:
             try:
+                _progress.set_current_thread(thread_id)
+                _progress.clear_cancel(thread_id)
                 _ensure_memory(agent, thread_id)
+                _repair_dangling_tool_calls(agent, thread_id)
                 _react_turn_events(agent, body.question, thread_id, lambda k, d: q.put((k, d)))
+            except _progress.IngestCancelled:
+                logger.info("Turno %s: ingesta detenida por el usuario", thread_id[:8])
+                _progress.clear_cancel(thread_id)
+                q.put(("cancelled", {"thread_id": thread_id}))
             except Exception as exc:
                 logger.exception("Turno ReAct falló: %s", exc)
                 q.put(("error", {"message": str(exc)}))
             finally:
+                _progress.unsubscribe(thread_id, listener)
+                _progress.clear(thread_id)
+                _progress.clear_cancel(thread_id)
                 q.put(("__end__", {}))
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -242,6 +336,25 @@ def confirm(body: ConfirmIn):
     box["decision"] = body.decision
     box["event"].set()
     return {"status": "resumed", "thread_id": body.thread_id}
+
+
+class CancelIn(BaseModel):
+    thread_id: str
+
+
+@app.post("/cancel")
+def cancel(body: CancelIn):
+    """Detiene una ingesta en curso. Cooperativo: termina el lote actual
+    (guarda lo avanzado para retomar) y cierra el turno. Si el turno está
+    parado en un HITL, la confirmación se resuelve como 'n'."""
+    from src.agent import progress as _progress
+
+    _progress.request_cancel(body.thread_id)
+    box = RESUME.get(body.thread_id)
+    if box is not None:
+        box["decision"] = "n"
+        box["event"].set()
+    return {"status": "cancelling", "thread_id": body.thread_id}
 
 
 @app.get("/conversations")
@@ -273,4 +386,9 @@ def delete_conversation(thread_id: str):
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse("static/index.html")
+    # Sin caché: el frontend evoluciona a menudo y una copia vieja en el
+    # navegador desincroniza la UI del backend (p. ej. botones sin endpoint).
+    return FileResponse(
+        "static/index.html",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )

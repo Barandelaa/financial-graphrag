@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import hashlib
 import logging
-import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
@@ -205,7 +205,18 @@ class DocumentChunker:
         if not text or token_count < self.min_chunk_size:
             return None
 
-        chunk_id = str(uuid.uuid4())
+        # ID determinista: re-parsear el mismo filing genera los mismos IDs,
+        # así la caché de triplets, Kuzu y LanceDB nunca se duplican ni se
+        # invalidan por un re-parseo (antes: uuid4 aleatorio por parseo).
+        stable_key = "|".join([
+            section.company_ticker,
+            str(section.fiscal_year),
+            section.section_id,
+            str(section.page_number),
+            str(seq),
+            text,
+        ])
+        chunk_id = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()[:32]
 
         return Chunk(
             chunk_id=chunk_id,

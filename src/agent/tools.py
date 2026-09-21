@@ -34,8 +34,8 @@ def _make_ingest_tool(pipeline: FinancialGraphRAGPipeline, confirm_inside: bool 
     a nivel de nodo (patrón agente determinista)."""
 
     @tool
-    def ingest_10k(ticker: str, year: int, use_cache: bool = False) -> str:
-        """Ingiere el 10-K de la SEC para un ticker y año y lo indexa en grafo+vector. Usar SOLO cuando el usuario pide explícitamente añadir/ingerir un ticker/año nuevo (ej: 'añade AAPL 2026'). La confirmación se pide automáticamente antes de ejecutar. ticker: cualquiera dado de alta en companies.json, year: 2020-2026."""
+    def ingest_10k(ticker: str, year: int, force_clean: bool = False) -> str:
+        """Ingiere el 10-K de la SEC para un ticker y año y lo indexa en grafo+vector. Usar para 'añade X' y también para 'continúa la ingesta de X': por defecto RETOMA donde se quedó (reutiliza chunks.json y aprovecha triplets.json). Solo re-parsea desde cero (borrando caché y stores del par) si force_clean=True explícito. La confirmación se pide automáticamente antes de ejecutar. ticker: cualquiera dado de alta en companies.json, year: 2020-2026."""
         from src.agent.company_registry import _ticker_key
 
         allowed = _allowed_tickers()
@@ -57,8 +57,19 @@ def _make_ingest_tool(pipeline: FinancialGraphRAGPipeline, confirm_inside: bool 
             if not _confirmed(ok):
                 return f"Ingesta cancelada por el usuario. No se ha ingerido {t}/{y}."
         try:
-            chunks = pipeline.ingest_and_index(ticker=t, year=y, use_cache=use_cache)
-            return f"OK: Ingested {len(chunks)} chunks for {t}/{y} -> data/processed_chunks/{t}_{y}/chunks.json + triplets.json (use_cache={use_cache})"
+            from reprocess_missing import reprocess_pair
+            from src.agent.progress import IngestCancelled
+
+            res = reprocess_pair(pipeline, t, y, force_clean=force_clean)
+            mode = "retomada donde se quedó" if res["resumed"] else "limpia desde cero"
+            return (
+                f"OK: {t}/{y} ingesta {mode}: {res['chunks']} chunks, "
+                f"triplets={res['triplets']}, persisted={res['persisted']} "
+                f"-> data/processed_chunks/{t}_{y}/"
+            )
+        except IngestCancelled:
+            logger.info("ingest_10k cancelada por el usuario para %s/%s", t, y)
+            return f"Ingesta de {t}/{y} detenida por el usuario. Progreso guardado en disco: el usuario puede pedir 'continúa la ingesta' para reanudar donde se quedó."
         except Exception as exc:
             logger.exception("ingest_10k failed %s/%s: %s", t, y, exc)
             return f"Error ingesting {t}/{y}: {exc}"
@@ -270,8 +281,137 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
         except Exception as exc:
             return f"Error company_news: {exc}"
 
+    @_tool
+    def suggest_companies(contexto: str = "") -> str:
+        """Suggest up to 5 companies with VERIFIED 10-K not in the DB. Mixes Finnhub peers of your indexed tickers + COMPETES_WITH graph rivals (+ `contexto` candidates for a sector). Every candidate passes EDGAR 10-K verification. Present as a numbered list, one item per candidate WITH its details (never bare tickers); let the USER choose; adding follows the double HITL."""
+        try:
+            from src.agent.company_registry import (
+                get_config_tickers,
+                load_universe,
+                resolve_company,
+                verify_10k,
+            )
+            from src.agent.market_data import get_company_profile, get_peers
+
+            indexed = {t.upper() for t in get_config_tickers()}
+            universe = load_universe()
+            ordered: list[tuple[str, str]] = []  # (ticker, evidencia)
+            seen: set[str] = set()
+
+            def _push(ticker: str, evidencia: str) -> None:
+                tu = (ticker or "").strip().upper()
+                if tu and tu not in indexed and tu not in seen:
+                    seen.add(tu)
+                    ordered.append((tu, evidencia))
+
+            # (a) Peers Finnhub de las indexadas
+            for t in sorted(indexed):
+                try:
+                    for p in get_peers(t):
+                        _push(p, f"Finnhub peer of {t}")
+                except Exception:
+                    continue
+            # (b) Competidores del grafo fuera de la BD
+            try:
+                for t in sorted(indexed):
+                    for f in rp.graph_facts_retriever.search(f"{t} competitors", top_k=30):
+                        if "COMPETES_WITH" in f:
+                            _push(f.split("--COMPETES_WITH-->")[-1].strip(), f"graph rival of {t}")
+            except Exception as exc:
+                logger.debug("suggest_companies: grafo omitido: %s", exc)
+            # (c) Contexto sectorial del usuario: intenta resolverlo en el universo SEC
+            if (contexto or "").strip():
+                try:
+                    res = resolve_company(contexto)
+                    for c in res.get("candidates", [])[:5]:
+                        _push(c["ticker"], f"candidato para {contexto!r} (universo SEC)")
+                except Exception:
+                    pass
+
+            # Verificación 10-K en EDGAR (filtro de verdad) hasta 5 OK.
+            # Formato lista con ficha legible para el usuario.
+            picked: list[str] = []
+            for tu, evidencia in ordered:
+                if len(picked) >= 5:
+                    break
+                info = universe.get(tu)
+                if not info:
+                    continue  # no es filer USA: no verificable, se descarta
+                try:
+                    v = verify_10k(info["cik"], tu)
+                except Exception:
+                    continue
+                if not v.get("ok"):
+                    continue
+                dates = ", ".join(v.get("recent_10k", [])[:2])
+                prof = get_company_profile(tu)
+                name = prof.get("name") or info.get("name", "")
+                # Acortar nombres de bolsa largos
+                exchange = prof.get("exchange", "")
+                _EXCHANGE_SHORT = {
+                    "NEW YORK STOCK EXCHANGE, INC.": "NYSE",
+                    "NEW YORK STOCK EXCHANGE": "NYSE",
+                    "NASDAQ NMS - GLOBAL MARKET": "NASDAQ",
+                    "NASDAQ CAPITAL MARKET": "NASDAQ",
+                    "Nasdaq Global Select": "NASDAQ",
+                }
+                exchange = _EXCHANGE_SHORT.get(exchange, exchange)
+                industry = prof.get("industry", "")
+                cap = prof.get("cap", "")
+                # Línea principal
+                n = len(picked) + 1
+                line1 = f"{n}. **{tu}** — {name}" if name else f"{n}. **{tu}**"
+                details = " · ".join(p for p in [industry, f"Cap: {cap}" if cap else "", exchange] if p)
+                line2 = f"   {details}" if details else ""
+                line3 = f"   10-K: {dates}" if dates else ""
+                entry = "\n".join(l for l in [line1, line2, line3] if l)
+                picked.append(entry)
+            if not picked:
+                return "No verified candidates right now. Ask the user for a sector or a name to narrow down (propose_new_company)."
+            lines = [
+                "Verified companies with 10-K available:\n",
+                *picked,
+                "\n---",
+                "INTERNAL — do NOT include this section in your reply. Present the candidates above with their details and ask the user which one(s) to add. After they choose: add_company_to_config, then ingest_10k.",
+            ]
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"Error suggest_companies: {exc}"
+
+    @_tool
+    def lookup_company(ticker: str) -> str:
+        """Ficha de una empresa: nombre, bolsa, industria, market cap, web y estado 10-K en EDGAR (+ si ya está en tu BD). Úsala cuando el usuario pida detalles de una candidata SUGERIDA o de cualquier ticker (NO uses company_news para esto: eso son titulares recientes, no la ficha). SOLO LECTURA."""
+        try:
+            from src.agent.company_registry import get_config_tickers, load_universe, verify_10k
+            from src.agent.market_data import get_company_profile
+
+            t = (ticker or "").strip().upper()
+            universe = load_universe()
+            info = universe.get(t, {})
+            prof = get_company_profile(t)
+            name = prof.get("name") or info.get("name", t)
+            parts = [p for p in [
+                prof.get("industry", ""),
+                f"cap {prof['cap']}" if prof.get("cap") else "",
+                prof.get("exchange", ""),
+                prof.get("web", ""),
+            ] if p]
+            detail = f" ({' · '.join(parts)})" if parts else ""
+            indexed = "SÍ, ya indexada" if t in {c.upper() for c in get_config_tickers()} else "no indexada"
+            if info.get("cik"):
+                try:
+                    v = verify_10k(info["cik"], t)
+                    filing = f"10-K recientes {', '.join(v.get('recent_10k', [])[:2])}" if v.get("ok") else f"sin 10-K: {v.get('reason', '')}"
+                except Exception:
+                    filing = "10-K no verificable ahora mismo"
+            else:
+                filing = "fuera del universo SEC (sin 10-K USA verificable)"
+            return f"{t} ({name}){detail} — en tu BD: {indexed} · {filing}."
+        except Exception as exc:
+            return f"Error lookup_company: {exc}"
+
     # Registro extensible: futuras tools (web_search...) se añaden a esta lista
-    return [query_financial_rag, lookup_metrics, financial_calculator, propose_new_company, add_company_to_config, ingest_tool, stock_price, company_news]
+    return [query_financial_rag, lookup_metrics, financial_calculator, propose_new_company, add_company_to_config, ingest_tool, stock_price, company_news, suggest_companies, lookup_company]
 
 
 def _rest_after_json_block(s: str) -> str | None:
