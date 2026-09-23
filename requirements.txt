@@ -7,7 +7,7 @@ sec-edgar-downloader>=5.0
 # === PDF / Document Parsing ===
 pdfplumber>=0.10.0
 markdownify>=0.11.0
-unstructured[pdf,html]>=0.12.0
+unstructured[pdf]>=0.12.0
 beautifulsoup4>=4.12.0
 
 # === Embeddings & Sentence Transformers ===
@@ -25,13 +25,14 @@ rank-bm25>=0.2.2
 kuzu>=0.6.0
 
 # === LLM / Inference (Groq + LangChain) ===
+# NOTA: sin langchain-community (paquete en sunset, traía validators Pydantic V1
+# deprecados) y sin el meta-paquete langchain (no se importa en el código).
+# Se usan solo core + integraciones dedicadas.
 ollama>=0.3.0
 langchain-core>=0.1.0
 langchain-groq>=0.1.0
 langchain-ollama>=0.2.0
 langchain-huggingface>=0.1.0
-langchain-community>=0.1.0
-langchain>=0.3.0
 langgraph>=0.2.0
 
 # === Graph community detection (Leiden) ===
@@ -47,3 +48,7 @@ psutil>=5.9.0
 # === Web API (FastAPI + Uvicorn, solo local) ===
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
+
+# === Desktop (pywebview = ventana nativa Windows WebView2) ===
+pywebview>=4.0
+pyinstaller>=6.0  # solo para generar el .exe

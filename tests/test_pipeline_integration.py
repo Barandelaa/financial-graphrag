@@ -32,8 +32,6 @@ for mod in (
     "langchain_ollama",
     "langchain_groq",
     "langchain_huggingface",
-    "langchain_community",
-    "langchain_community.chat_models",
     "sec_edgar_downloader",
 ):
     sys.modules.setdefault(mod, types.ModuleType(mod))

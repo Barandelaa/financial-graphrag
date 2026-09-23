@@ -55,10 +55,7 @@ def create_llm(
     json_mode: bool = True,
 ) -> BaseChatModel:
     if prefer_ollama and _ollama_available(ollama_base_url, ollama_model):
-        try:
-            from langchain_ollama import ChatOllama
-        except ImportError:
-            from langchain_community.chat_models import ChatOllama
+        from langchain_ollama import ChatOllama
 
         logger.info(
             "Using local Ollama model: %s (num_predict=%d, num_ctx=%d, keep_alive=%s)",

@@ -388,6 +388,32 @@ def delete_conversation(thread_id: str):
 def index():
     # Sin caché: el frontend evoluciona a menudo y una copia vieja en el
     # navegador desincroniza la UI del backend (p. ej. botones sin endpoint).
+    # Ruta robusta: funciona tanto en `uvicorn api:app` como en .exe
+    # congelado con PyInstaller (sys._MEIPASS) o junto al ejecutable.
+    import sys
+    from pathlib import Path
+
+    candidates = []
+    try:
+        candidates.append(Path(__file__).resolve().parent / "static" / "index.html")
+    except Exception:
+        pass
+    if getattr(sys, "frozen", False):
+        try:
+            candidates.append(Path(sys.executable).resolve().parent / "static" / "index.html")
+            candidates.append(Path(getattr(sys, "_MEIPASS", "")) / "static" / "index.html")
+        except Exception:
+            pass
+    candidates.append(Path.cwd() / "static" / "index.html")
+    for p in candidates:
+        try:
+            if p and p.is_file():
+                return FileResponse(
+                    str(p),
+                    headers={"Cache-Control": "no-store, must-revalidate"},
+                )
+        except Exception:
+            continue
     return FileResponse(
         "static/index.html",
         headers={"Cache-Control": "no-store, must-revalidate"},

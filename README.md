@@ -1,6 +1,6 @@
 # Financial GraphRAG Engine
 
-Sistema de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (las cuentas que las empresas cotizadas de EE. UU. presentan al regulador). Combina tres formas de recuperar información —**búsqueda vectorial densa, búsqueda léxica BM25 y grafo de conocimiento**— y genera respuestas con **citas a los fragmentos originales**. Con **dos agentes LangGraph** locales (`qwen3:8b`): determinista con **memoria Q/A** y **ReAct** con **10 tools** (retrieval RAG, métricas scoping, calculadora financiera, alta SEC, sugerencias de competidores con 10-K verificado, ficha corporativa y cotizaciones/noticias en tiempo real vía Finnhub API), **servidor web FastAPI con streaming SSE, barras de progreso de ingesta en vivo, cancelación cooperativa sin pérdida de datos e interfaz tipo ChatGPT** y tabla de métricas scoping `TICKER_YEAR`.
+Sistema de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (las cuentas que las empresas cotizadas de EE. UU. presentan al regulador). Combina tres formas de recuperar información —**búsqueda vectorial densa, búsqueda léxica BM25 y grafo de conocimiento**— y genera respuestas con **citas a los fragmentos originales**. Con **dos agentes LangGraph** locales (`qwen3:8b`): determinista con **memoria Q/A** y **ReAct** con **10 tools** (retrieval RAG, métricas scoping, calculadora financiera, alta SEC, sugerencias de competidores con 10-K verificado, ficha corporativa y cotizaciones/noticias en tiempo real vía Finnhub API), **servidor web FastAPI con streaming SSE, barras de progreso de ingesta en vivo, cancelación cooperativa sin pérdida de datos e interfaz tipo ChatGPT** y tabla de métricas scoping `TICKER_YEAR`. La misma web se empaqueta como **app de escritorio Windows** con `desktop.py` (pywebview/WebView2) y `build_desktop.ps1` (PyInstaller).
 
 Ejemplo de lo que responde:
 
@@ -170,6 +170,35 @@ curl -X POST localhost:8000/confirm -H "Content-Type: application/json" -d "{\"t
 curl -X POST localhost:8000/cancel -H "Content-Type: application/json" -d "{\"thread_id\":\"...\"}"
 ```
 
+### App de escritorio Windows (pywebview)
+
+Reutiliza la web tal cual: `desktop.py` levanta `api.py` en un hilo uvicorn y abre `static/index.html` en una ventana nativa (WebView2, sin Chrome extra). Sin cambios en el frontend (usa rutas relativas).
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt  # incluye pywebview
+.\.venv\Scripts\python.exe desktop.py
+# Variables opcionales: DESKTOP_PORT=8000, DESKTOP_WIDTH=1220, DESKTOP_HEIGHT=820, DESKTOP_DEBUG=1
+```
+
+Notas:
+- Sin `--reload` a propósito (igual que la API): no duplica el modelo en VRAM. El arranque puede tardar 1-3 min (bge-m3 + reranker + qwen3:8b).
+- Al cerrar la ventana se apaga uvicorn (guarda Kuzu/LanceDB limpiamente). No abras dos instancias a la vez (Kuzu = un solo escritor).
+- Requisitos en el PC que la ejecuta: Ollama con `ollama pull qwen3:8b`, WebView2 (preinstalado en Win10/11) y `.env` con `FINNHUB_API_KEY` opcional.
+
+Generar `.exe` auto-bootstrap (un solo ejecutable independiente, con consola para ver logs):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_desktop.ps1
+# genera: dist\FinancialGraphRAG.exe (un solo archivo empaquetado)
+```
+
+**Mecanismo de Auto-Bootstrap al hacer doble clic**:
+1. **Directorios y datos**: Si faltan, crea automáticamente las carpetas `data/`, `logs/` y restaura `data/companies.json` y la plantilla `.env` junto al `.exe` a partir de los datos empaquetados en el binario.
+2. **Asistente de configuración inicial**: Si no hay claves en `.env` o no detecta Ollama, muestra una ventana de bienvenida para introducir `FINNHUB_API_KEY`, `HF_TOKEN` y enlaces directos para instalar Ollama o descargar `qwen3:8b`.
+3. **Descarga asistida del modelo**: Si detecta que Ollama está en ejecución pero falta el modelo local, ejecuta automáticamente `ollama pull qwen3:8b` en segundo plano.
+4. **Protección de instancia única**: Bloquea la apertura accidental de múltiples instancias con un lock de socket local (`127.0.0.1:8765`), garantizando que la base de datos monoproceso Kùzu no se corrompa.
+5. **Resolución robusta de frontend**: `api.py:index()` busca `static/index.html` de forma adaptable en `sys._MEIPASS` (extracción temporal del onefile), junto al ejecutable o en el directorio de trabajo.
+
 ### Desde Python
 
 ```python
@@ -219,8 +248,10 @@ pip install pytest && python -m pytest tests/ -v
 
 ```
 financial-graphrag/
-├── api.py                      # Servidor FastAPI (SSE streaming, progreso, HITL wait/resume, cancelación, CRUD historial)
+├── api.py                      # Servidor FastAPI (SSE streaming, progreso, HITL wait/resume, cancelación, CRUD historial; index() adaptable a .exe)
 ├── cli.py                      # REPL agente LangGraph (Streaming en vivo, Dispatch table, HITL Command(resume=...))
+├── desktop.py                  # App escritorio Windows: uvicorn en hilo + ventana pywebview/WebView2 + setup inicial
+├── build_desktop.ps1           # Genera dist\FinancialGraphRAG.exe con PyInstaller (--onefile, --console, auto-bootstrap)
 ├── reprocess_missing.py        # Detecta faltantes/parciales y ingesta con workers/batch (soporta reanudar/limpio con locks)
 ├── static/
 │   └── index.html              # Frontend Web SPA (ChatGPT-style, SSE, barras de progreso por año, botón Detener, tarjetas HITL)
@@ -232,6 +263,7 @@ financial-graphrag/
 │   ├── vector_store/lancedb/   # LanceDB bge-m3 (ignorado)
 │   └── graph/kuzu_db/          # Kuzu DB (ignorado)
 ├── src/
+│   ├── bootstrap.py            # Auto-bootstrap para .exe: crea carpetas/data/.env, chequea/pull Ollama, lock de instancia única
 │   ├── agent/                  # Determinista + ReAct (100% local)
 │   │   ├── state.py            # AgentState (messages Q/A, no chunks)
 │   │   ├── tools.py            # 10 tools ReAct + interrupt() nativo + calculator + SEC registry + Finnhub + suggestions
@@ -292,6 +324,7 @@ Notas:
 | LLM | Ollama `qwen3:8b` `reasoning=False, num_ctx 8192` (`format=json` en determinista/extractor; `tool_calls` nativos en ReAct) → Groq fallback |
 | Framework | LangChain / LangGraph (StateGraph determinista + ReAct `create_react_agent`, ToolNode HITL) |
 | Web API & UI | FastAPI, Uvicorn, Server-Sent Events (SSE), HTML5/Tailwind/CSS |
+| App escritorio | pywebview (WebView2 en Windows) + PyInstaller (`desktop.py`, `build_desktop.ps1`) |
 | APIs Externas | Finnhub REST API (cotizaciones en tiempo real, noticias financieras) |
 | Reranker | BAAI/bge-reranker-v2-m3 |
 | Comunidades | Leiden + igraph + networkx |
