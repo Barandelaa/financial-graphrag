@@ -297,8 +297,40 @@ class GraphTraversalRetriever:
         chunk_scores: Dict[str, float],
         top_k: int,
     ) -> List[GraphSearchResult]:
-        results: List[GraphSearchResult] = []
-        for cid in chunk_ids[:top_k]:
+        wanted = chunk_ids[:top_k]
+        if not wanted:
+            return []
+        by_id: Dict[str, tuple] = {}
+        # Batch fetch con IN: 1 query en vez de N (evita N+1 round-trips).
+        # Kùzu no soporta listas Python como parámetros en 'IN $param';
+        # sanitizamos IDs seguros (alfanuméricos/guiones) e interpolamos el literal.
+        safe_ids = [
+            cid for cid in wanted
+            if isinstance(cid, str) and re.fullmatch(r"[a-zA-Z0-9_\-]+", cid)
+        ]
+        batch_succeeded = False
+        if safe_ids:
+            try:
+                ids_literal = "[" + ", ".join(f"'{cid}'" for cid in safe_ids) + "]"
+                result = conn.execute(
+                    f"""
+                    MATCH (c:DocumentChunk)
+                    WHERE c.chunk_id IN {ids_literal}
+                    RETURN c.chunk_id, c.text, c.company_ticker,
+                           c.fiscal_year, c.section_id, c.page_number
+                    """
+                )
+                while result.has_next():
+                    row = result.get_next()
+                    by_id[str(row[0])] = row
+                batch_succeeded = True
+            except Exception as exc:
+                logger.debug("Batched chunk fetch failed, fallback to loop: %s", exc)
+
+        # Chunks pendientes: si falló el batch se consultan todos; si funcionó,
+        # solo los que no cumplieron el regex safe_ids (evita pérdidas silenciosas).
+        unqueried = wanted if not batch_succeeded else [cid for cid in wanted if cid not in safe_ids]
+        for cid in unqueried:
             try:
                 result = conn.execute(
                     """
@@ -311,21 +343,29 @@ class GraphTraversalRetriever:
                 )
                 if result.has_next():
                     row = result.get_next()
-                    results.append(
-                        GraphSearchResult(
-                            chunk_id=str(row[0]),
-                            text=str(row[1]),
-                            score=chunk_scores.get(str(row[0]), 0.0),
-                            metadata={
-                                "company_ticker": str(row[2]),
-                                "fiscal_year": str(row[3]),
-                                "section_id": str(row[4]),
-                                "page_number": str(row[5]),
-                            },
-                            traversal_path=f"entity_graph_{cid[:8]}",
-                        )
-                    )
+                    by_id[str(row[0])] = row
             except RuntimeError:
                 continue
 
+        # Preserva el orden por score
+        ordered = sorted(wanted, key=lambda cid: chunk_scores.get(cid, 0.0), reverse=True)
+        results: List[GraphSearchResult] = []
+        for cid in ordered:
+            row = by_id.get(cid)
+            if row is None:
+                continue
+            results.append(
+                GraphSearchResult(
+                    chunk_id=str(row[0]),
+                    text=str(row[1]),
+                    score=chunk_scores.get(str(row[0]), 0.0),
+                    metadata={
+                        "company_ticker": str(row[2]),
+                        "fiscal_year": str(row[3]),
+                        "section_id": str(row[4]),
+                        "page_number": str(row[5]),
+                    },
+                    traversal_path=f"entity_graph_{cid[:8]}",
+                )
+            )
         return results[:top_k]

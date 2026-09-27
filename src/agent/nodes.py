@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import logging
 import re
 from enum import Enum
@@ -151,7 +152,22 @@ def parallel_retrieve_node(pipeline, state: dict) -> dict:
         # ante follow-up, antepone ticker histórico para retrieval scoping
         effective_question = f"{hist_ticker} {question}"
     expanded = rp._expand_query(effective_question)
-    dense = rp.dense.search(expanded, top_k=rp.top_k_dense)
+    # Prefilter denso con fast-path (sin Kuzu) si está disponible.
+    _fast = getattr(rp, "_fast_query_tickers", None)
+    _tickers = _fast(effective_question) if callable(_fast) else set()
+    search_fn = getattr(getattr(rp, "dense", None), "search", None)
+    if search_fn is not None:
+        try:
+            supports_tickers = "tickers" in inspect.signature(search_fn).parameters
+        except (ValueError, TypeError):
+            supports_tickers = False
+
+        if supports_tickers:
+            dense = search_fn(expanded, top_k=rp.top_k_dense, tickers=_tickers or None)
+        else:
+            dense = search_fn(expanded, top_k=rp.top_k_dense)
+    else:
+        dense = []
     sparse = rp.sparse.search(expanded, top_k=rp.top_k_sparse)
     graph = rp.graph.search(expanded, top_k=rp.top_k_graph)
     facts = rp.graph_facts_retriever.search(effective_question, top_k=rp.max_facts)

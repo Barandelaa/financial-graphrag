@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 
@@ -31,6 +33,7 @@ class RetrievalResult:
     graph_facts: List[str] = field(default_factory=list)
     metrics_rows: List[dict] = field(default_factory=list)
     final_context: List[RerankedResult] = field(default_factory=list)
+    timings: Dict[str, float] = field(default_factory=dict)
 
 
 class RetrievalPipeline:
@@ -42,10 +45,10 @@ class RetrievalPipeline:
         dense_model: str = "BAAI/bge-m3",
         reranker_model: str = "BAAI/bge-reranker-v2-m3",
         rrf_k: int = 60,
-        top_k_dense: int = 20,
+        top_k_dense: int = 15,
         top_k_sparse: int = 20,
         top_k_graph: int = 20,
-        top_k_rrf: int = 50,
+        top_k_rrf: int = 20,
         top_k_final: int = 5,
         max_facts: int = 20,
         rerank_diversity: float = 0.7,
@@ -115,16 +118,27 @@ class RetrievalPipeline:
         return question
 
     def query(self, question: str) -> RetrievalResult:
+        t0 = time.perf_counter()
         expanded = self._expand_query(question)
-        dense_results = self.dense.search(expanded, top_k=self.top_k_dense)
+        # Filtro temprano por ticker: el denso aplica WHERE con prefilter
+        # antes del scan, así top_k no se desperdicia en otras empresas.
+        # Fast-path por alias (regex barato) para no pagar Kuzu antes del denso.
+        tickers = self._fast_query_tickers(question)
+        t_tick = time.perf_counter()
+        dense_results = self.dense.search(expanded, top_k=self.top_k_dense, tickers=tickers)
+        t_dense = time.perf_counter()
         sparse_results = self.sparse.search(expanded, top_k=self.top_k_sparse)
+        t_sparse = time.perf_counter()
         graph_results = self.graph.search(expanded, top_k=self.top_k_graph)
+        t_graph = time.perf_counter()
         graph_facts = self.graph_facts_retriever.search(
             question, top_k=self.max_facts
         )
+        t_facts = time.perf_counter()
 
         metrics_rows = self.metrics_retriever.search(question)
         metrics_block = self.metrics_retriever.format_as_block(metrics_rows)
+        t_metrics = time.perf_counter()
 
         logger.debug(
             "Retrieval counts — dense=%d sparse=%d graph=%d facts=%d metrics=%d",
@@ -142,7 +156,7 @@ class RetrievalPipeline:
             top_k=self.top_k_rrf,
         )
 
-        fused = self._ground_to_query(fused, question)
+        fused = self._ground_to_query(fused, question, tickers=tickers)
 
         candidates = self._dedupe_candidates(fused)
 
@@ -153,6 +167,7 @@ class RetrievalPipeline:
             diversity_lambda=self.rerank_diversity,
             min_score=self.rerank_min_score,
         )
+        t_rerank = time.perf_counter()
 
         final_context = reranked
 
@@ -161,6 +176,32 @@ class RetrievalPipeline:
             context=final_context,
             graph_facts=graph_facts,
             metrics_table=metrics_block,
+        )
+        t_gen = time.perf_counter()
+
+        timings = {
+            "tickers_ms": round((t_tick - t0) * 1000, 2),
+            "dense_ms": round((t_dense - t_tick) * 1000, 2),
+            "sparse_ms": round((t_sparse - t_dense) * 1000, 2),
+            "graph_ms": round((t_graph - t_sparse) * 1000, 2),
+            "facts_ms": round((t_facts - t_graph) * 1000, 2),
+            "metrics_ms": round((t_metrics - t_facts) * 1000, 2),
+            "fuse_rerank_ms": round((t_rerank - t_metrics) * 1000, 2),
+            "generate_ms": round((t_gen - t_rerank) * 1000, 2),
+            "total_ms": round((t_gen - t0) * 1000, 2),
+        }
+
+        logger.debug(
+            "Retrieval timings ms — tickers=%.0f dense=%.0f sparse=%.0f graph=%.0f facts=%.0f metrics=%.0f fuse_rerank=%.0f generate=%.0f total=%.0f",
+            timings["tickers_ms"],
+            timings["dense_ms"],
+            timings["sparse_ms"],
+            timings["graph_ms"],
+            timings["facts_ms"],
+            timings["metrics_ms"],
+            timings["fuse_rerank_ms"],
+            timings["generate_ms"],
+            timings["total_ms"],
         )
 
         # Unifica citas de contexto + métricas scoping (para que chunk_id de métrica aparezca en Citas)
@@ -189,6 +230,7 @@ class RetrievalPipeline:
             graph_facts=graph_facts,
             metrics_rows=[r.__dict__ for r in metrics_rows],
             final_context=final_context,
+            timings=timings,
         )
 
     _COMPANY_ALIAS_TO_TICKER = {
@@ -199,39 +241,53 @@ class RetrievalPipeline:
         "meta": "META", "facebook": "META",
         "tesla": "TSLA", "nvidia": "NVDA",
         "berkshire": "BRK.B", "berkshire hathaway": "BRK.B",
+        "jpmorgan": "JPM", "jpmorgan chase": "JPM",
+        "boeing": "BA",
+        "johnson & johnson": "JNJ", "j&j": "JNJ",
+        "coca-cola": "KO", "coca cola": "KO",
+        "pfizer": "PFE",
+        "walmart": "WMT",
+        "exxon": "XOM", "exxonmobil": "XOM",
     }
 
-    def _query_tickers(self, question: str) -> set[str]:
-        try:
-            entities = self.graph.match_query_entities(question)
-            tickers = {name for name, entity_type in entities if entity_type == "Company"}
-            if tickers:
-                return tickers
-        except Exception:
-            pass
-        # Fallback alias regex para casos como "Apples" / "Apple" que el grafo no matchea por plural
-        import re
-        q_low = (question or "").lower()
+    def _fast_query_tickers(self, question: str) -> set[str]:
+        """Alias regex barato (sin tocar Kuzu): para prefilter denso. Acumula multi-empresa."""
+        if not question:
+            return set()
+        matched: set[str] = set()
+        q_low = question.lower()
         for alias, ticker in self._COMPANY_ALIAS_TO_TICKER.items():
             if re.search(r"\b" + re.escape(alias) + r"\b", q_low):
-                return {ticker}
-        # Tickers dados de alta en companies.json (dinámico, sin curado)
+                matched.add(ticker)
         try:
             from src.agent.company_registry import get_config_tickers
 
             for t in sorted(get_config_tickers(), key=len, reverse=True):
-                if re.search(r"\b" + re.escape(t) + r"\b", question or "", re.IGNORECASE):
-                    return {t.upper()}
+                if re.search(r"\b" + re.escape(t) + r"\b", question, re.IGNORECASE):
+                    matched.add(t.upper())
         except Exception:
             pass
-        return set()
+        return matched
+
+    def _query_tickers(self, question: str) -> set[str]:
+        # 1) Fast-path sin I/O (cubre el 95% y acumula multi-empresa).
+        tickers = set(self._fast_query_tickers(question))
+        # 2) Complementar con entidades del grafo si hay
+        try:
+            entities = self.graph.match_query_entities(question)
+            tickers |= {name for name, entity_type in entities if entity_type == "Company"}
+        except Exception:
+            pass
+        return tickers
 
     def _ground_to_query(
         self,
         candidates: List[FusedResult],
         question: str,
+        tickers: set[str] | None = None,
     ) -> List[FusedResult]:
-        tickers = self._query_tickers(question)
+        if tickers is None:
+            tickers = self._query_tickers(question)
         if not tickers:
             return candidates
         return [
