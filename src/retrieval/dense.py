@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -10,6 +13,13 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
+
+_EMBED_CACHE_MAX = 200
+
+
+def _normalize_embed_key(text: str) -> str:
+    # Solo colapsa espacios (NO lower): el embedding es case-sensitive.
+    return re.sub(r"\s+", " ", (text or "").strip())
 
 
 def _detect_device(preferred: str) -> str:
@@ -47,6 +57,12 @@ class DenseRetriever:
         self._embedder: Optional[SentenceTransformer] = None
         self._device = _detect_device(device)
         self._scalar_indices_ready = False
+        # Caché A: pregunta normalizada -> vector (ahorra 1 encode bge-m3
+        # por repetición; ~4KB/entrada, LRU 200 ≈ <1MB, thread-safe).
+        self._embed_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._embed_cache_lock = threading.Lock()
+        self._embed_cache_hits = 0
+        self._embed_cache_misses = 0
 
         Path(db_uri).parent.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(self.db_uri)
@@ -70,7 +86,50 @@ class DenseRetriever:
         )
 
     def embed_query(self, query: str) -> np.ndarray:
-        return self.embedder.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
+        key = _normalize_embed_key(query)
+        with self._embed_cache_lock:
+            hit = self._embed_cache.get(key)
+            if hit is not None:
+                self._embed_cache.move_to_end(key)
+                self._embed_cache_hits += 1
+                return hit.copy()
+            self._embed_cache_misses += 1
+        vec = self.embedder.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
+        vec = np.asarray(vec)
+        with self._embed_cache_lock:
+            self._embed_cache[key] = vec.copy()
+            self._embed_cache.move_to_end(key)
+            while len(self._embed_cache) > _EMBED_CACHE_MAX:
+                self._embed_cache.popitem(last=False)
+        return vec
+
+    def embed_cache_info(self) -> dict:
+        with self._embed_cache_lock:
+            return {
+                "size": len(self._embed_cache),
+                "hits": self._embed_cache_hits,
+                "misses": self._embed_cache_misses,
+            }
+
+    def embed_cache_clear(self) -> None:
+        with self._embed_cache_lock:
+            self._embed_cache.clear()
+            self._embed_cache_hits = 0
+            self._embed_cache_misses = 0
+
+    def warmup(self) -> None:
+        """Precarga el modelo en memoria (best-effort).
+
+        La primera pregunta pagaba la carga de bge-m3 (~segundos + VRAM);
+        llamarlo al arrancar mueve ese coste fuera del camino crítico.
+        """
+        try:
+            self.embedder.encode(
+                ["warmup query"], normalize_embeddings=True, show_progress_bar=False
+            )
+            logger.debug("Dense embedder warmed up (%s)", self.model_name)
+        except Exception as exc:
+            logger.debug("Dense warmup skipped: %s", exc)
 
     @staticmethod
     def build_ticker_filter(tickers: set[str] | List[str] | None) -> Optional[str]:

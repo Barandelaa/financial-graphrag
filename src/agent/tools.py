@@ -88,7 +88,20 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
     def query_financial_rag(question: str) -> str:
         """Busca en los 10-K indexados (dense BM25 grafo + rerank). Úsala para CUALQUIER pregunta sobre tickers/años: segmentos, métricas, riesgos Y COMPETIDORES (hechos COMPETES_WITH del grafo). Devuelve SOLO evidencia (hechos + tabla + citas): compón tu respuesta a partir de estos bloques."""
         try:
+            import time as _time
+
+            _t0 = _time.perf_counter()
             result = pipeline.query(question)
+            _total_ms = (_time.perf_counter() - _t0) * 1000
+            _timings = getattr(result, "timings", {}) or {}
+            logger.info(
+                "query_financial_rag total=%.0fms (fuse_rerank=%.0f generate=%.0f embed_cache hits=%.0f misses=%.0f)",
+                _total_ms,
+                _timings.get("fuse_rerank_ms", 0),
+                _timings.get("generate_ms", 0),
+                _timings.get("embed_cache_hits", 0),
+                _timings.get("embed_cache_misses", 0),
+            )
             lines = ["EVIDENCE (compose your answer from these blocks; do not paste them verbatim):", ""]
             if result.graph_facts:
                 lines.append("GRAPH FACTS (ideas de apoyo SIN chunk propio; citalas solo con un chunk_id real de CITATIONS):")
@@ -104,15 +117,10 @@ def make_react_tools(pipeline: FinancialGraphRAGPipeline):
                 lines.append("CITATIONS (únicos chunk_id válidos para citar; NO inventes otros ni uses relaciones como chunk):")
                 for c in result.citations[:5]:
                     lines.append(f"- {c.get('company_ticker')} | {c.get('fiscal_year')} | {c.get('section_id')} | chunk {c.get('chunk_id')}")
-            # VRAM: cede a Ollama tras rerank/embeddings
-            try:
-                import gc as _gc
-                import torch as _torch
-                if _torch.cuda.is_available():
-                    _torch.cuda.empty_cache()
-                _gc.collect()
-            except Exception:
-                pass
+            # NOTA: sin empty_cache()/gc por query (stalls de cientos de ms).
+            # Con 12GB VRAM el pico de embed+rerank cabe; ante CUDA OOM el
+            # error ya indica reintentar tras liberar. Ver fuse_rerank_node
+            # si el path determinista necesita la misma política.
             return "\n".join(lines)
         except Exception as exc:
             logger.exception("query_financial_rag failed: %s", exc)

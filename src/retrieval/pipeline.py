@@ -117,28 +117,93 @@ class RetrievalPipeline:
             return question + " " + " ".join(extras)
         return question
 
+    def warmup(self) -> None:
+        """Precarga embedder + reranker fuera del camino crítico (best-effort).
+
+        La primera pregunta pagaba la carga de ambos modelos; llamarlo al
+        arrancar (hilo fondo) mueve esos segundos al inicio. Sin caché que
+        invalidar: solo carga pesos en memoria.
+        """
+        try:
+            self.dense.warmup()
+        except Exception as exc:
+            logger.debug("Pipeline warmup (dense) skipped: %s", exc)
+        try:
+            # Un predict dummy carga el CrossEncoder sin contaminar nada.
+            from src.retrieval.rrf import FusedResult as _FR
+
+            self.reranker.rerank(
+                query="warmup",
+                candidates=[_FR(chunk_id="w", text="warmup text", rrf_score=1.0, metadata={})],
+                top_k=1,
+                min_score=0.0,
+            )
+        except Exception as exc:
+            logger.debug("Pipeline warmup (reranker) skipped: %s", exc)
+
+    def _tickers_from_matched(
+        self, matched: List[tuple[str, str]], question: str
+    ) -> set[str]:
+        """Tickers full sin re-consultar Kuzu: fast-path + entidades Company ya matcheadas."""
+        tickers = set(self._fast_query_tickers(question))
+        try:
+            tickers |= {name for name, entity_type in (matched or []) if entity_type == "Company"}
+        except Exception:
+            pass
+        return tickers
+
     def query(self, question: str) -> RetrievalResult:
+        from concurrent.futures import ThreadPoolExecutor
+
         t0 = time.perf_counter()
         expanded = self._expand_query(question)
         # Filtro temprano por ticker: el denso aplica WHERE con prefilter
         # antes del scan, así top_k no se desperdicia en otras empresas.
         # Fast-path por alias (regex barato) para no pagar Kuzu antes del denso.
-        tickers = self._fast_query_tickers(question)
+        tickers_fast = self._fast_query_tickers(question)
         t_tick = time.perf_counter()
-        dense_results = self.dense.search(expanded, top_k=self.top_k_dense, tickers=tickers)
-        t_dense = time.perf_counter()
-        sparse_results = self.sparse.search(expanded, top_k=self.top_k_sparse)
-        t_sparse = time.perf_counter()
-        graph_results = self.graph.search(expanded, top_k=self.top_k_graph)
-        t_graph = time.perf_counter()
-        graph_facts = self.graph_facts_retriever.search(
-            question, top_k=self.max_facts
-        )
-        t_facts = time.perf_counter()
-
-        metrics_rows = self.metrics_retriever.search(question)
-        metrics_block = self.metrics_retriever.format_as_block(metrics_rows)
-        t_metrics = time.perf_counter()
+        # Paralelo: denso (embed, libera GIL en torch) + disperso corren en
+        # hilos mientras el hilo principal hace el trabajo Kuzu (una sola
+        # conexión a la vez: kuzu.Connection no se comparte entre hilos).
+        # Mismo recall que en serie: solo cambia el solape temporal.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag") as ex:
+            f_dense = ex.submit(
+                self.dense.search, expanded, self.top_k_dense, tickers_fast
+            )
+            f_sparse = ex.submit(self.sparse.search, expanded, self.top_k_sparse)
+            # Entity matching UNA vez: graph usa expanded, facts usa question.
+            # Si coinciden se reutiliza; antes se matcheaba 3-4 veces por pregunta.
+            matched_expanded = self.graph.match_query_entities(expanded)
+            t_match = time.perf_counter()
+            graph_results = self.graph.search(
+                expanded, top_k=self.top_k_graph, matched=matched_expanded
+            )
+            t_graph = time.perf_counter()
+            matched_q = (
+                matched_expanded if expanded == question
+                else self.graph.match_query_entities(question)
+            )
+            graph_facts = self.graph_facts_retriever.search(
+                question, top_k=self.max_facts, matched=matched_q
+            )
+            t_facts = time.perf_counter()
+            metrics_rows = self.metrics_retriever.search(question)
+            metrics_block = self.metrics_retriever.format_as_block(metrics_rows)
+            t_metrics = time.perf_counter()
+            try:
+                dense_results = f_dense.result()
+            except Exception as exc:
+                logger.warning("Dense branch failed: %s", exc)
+                dense_results = []
+            t_dense = time.perf_counter()
+            try:
+                sparse_results = f_sparse.result()
+            except Exception as exc:
+                logger.warning("Sparse branch failed: %s", exc)
+                sparse_results = []
+            t_sparse = time.perf_counter()
+        # Tickers full para grounding (fast + grafo) sin consultas extra.
+        tickers = self._tickers_from_matched(matched_q, question) or tickers_fast
 
         logger.debug(
             "Retrieval counts — dense=%d sparse=%d graph=%d facts=%d metrics=%d",
@@ -179,29 +244,41 @@ class RetrievalPipeline:
         )
         t_gen = time.perf_counter()
 
+        try:
+            embed_cache = self.dense.embed_cache_info()
+        except Exception:
+            embed_cache = {}
         timings = {
             "tickers_ms": round((t_tick - t0) * 1000, 2),
-            "dense_ms": round((t_dense - t_tick) * 1000, 2),
-            "sparse_ms": round((t_sparse - t_dense) * 1000, 2),
-            "graph_ms": round((t_graph - t_sparse) * 1000, 2),
+            "match_ms": round((t_match - t_tick) * 1000, 2),
+            "graph_ms": round((t_graph - t_match) * 1000, 2),
             "facts_ms": round((t_facts - t_graph) * 1000, 2),
             "metrics_ms": round((t_metrics - t_facts) * 1000, 2),
-            "fuse_rerank_ms": round((t_rerank - t_metrics) * 1000, 2),
+            # dense/sparse corren en hilos en paralelo al trabajo Kuzu;
+            # join_* = espera residual tras metrics (idealmente ~0 si solapó).
+            "join_dense_ms": round((t_dense - t_metrics) * 1000, 2),
+            "join_sparse_ms": round((t_sparse - t_dense) * 1000, 2),
+            "fuse_rerank_ms": round((t_rerank - t_sparse) * 1000, 2),
             "generate_ms": round((t_gen - t_rerank) * 1000, 2),
             "total_ms": round((t_gen - t0) * 1000, 2),
+            "embed_cache_hits": float(embed_cache.get("hits", 0)),
+            "embed_cache_misses": float(embed_cache.get("misses", 0)),
         }
 
-        logger.debug(
-            "Retrieval timings ms — tickers=%.0f dense=%.0f sparse=%.0f graph=%.0f facts=%.0f metrics=%.0f fuse_rerank=%.0f generate=%.0f total=%.0f",
+        logger.info(
+            "Retrieval timings ms — tickers=%.0f match=%.0f graph=%.0f facts=%.0f metrics=%.0f join_dense=%.0f join_sparse=%.0f fuse_rerank=%.0f generate=%.0f total=%.0f (embed_cache hits=%.0f misses=%.0f)",
             timings["tickers_ms"],
-            timings["dense_ms"],
-            timings["sparse_ms"],
+            timings["match_ms"],
             timings["graph_ms"],
             timings["facts_ms"],
             timings["metrics_ms"],
+            timings["join_dense_ms"],
+            timings["join_sparse_ms"],
             timings["fuse_rerank_ms"],
             timings["generate_ms"],
             timings["total_ms"],
+            timings["embed_cache_hits"],
+            timings["embed_cache_misses"],
         )
 
         # Unifica citas de contexto + métricas scoping (para que chunk_id de métrica aparezca en Citas)

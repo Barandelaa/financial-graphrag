@@ -96,8 +96,14 @@ class GraphFactRetriever:
         self.max_facts_per_entity = max_facts_per_entity
         self.max_total = max_total
 
-    def search(self, query: str, top_k: int = 30) -> List[str]:
-        matched = self.traversal.match_query_entities(query)
+    def search(
+        self,
+        query: str,
+        top_k: int = 30,
+        matched: List[tuple[str, str]] | None = None,
+    ) -> List[str]:
+        if matched is None:
+            matched = self.traversal.match_query_entities(query)
         if not matched:
             return []
 

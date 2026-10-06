@@ -66,6 +66,18 @@ class FinancialGraphRAGPipeline:
             graph_schema=self.graph.schema,
             dense_db_uri=vector_db_uri,
         )
+        # Warm-up en fondo: precarga bge-m3 + reranker fuera del camino
+        # crítico para que la primera pregunta no pague la carga (~segundos).
+        # Daemon + best-effort: nunca bloquea ni rompe el arranque.
+        try:
+            import threading as _th
+
+            _t = _th.Thread(
+                target=self.retrieval.warmup, name="rag-warmup", daemon=True
+            )
+            _t.start()
+        except Exception as exc:
+            logger.debug("Retrieval warmup thread skipped: %s", exc)
 
     def ingest_and_index(
         self,

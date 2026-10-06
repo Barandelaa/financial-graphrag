@@ -154,20 +154,29 @@ class GraphTraversalRetriever:
         self,
         query: str,
         top_k: int = 20,
+        matched: List[tuple[str, str]] | None = None,
     ) -> List[GraphSearchResult]:
-        entity_candidates = self.extract_entities(query)
-        if not entity_candidates:
-            return []
-
         conn = self.schema.connection
-        matched_entities = self._match_entities(conn, entity_candidates)
+        if matched is None:
+            entity_candidates = self.extract_entities(query)
+            if not entity_candidates:
+                return []
+            matched_entities = self._match_entities(conn, entity_candidates)
+        else:
+            matched_entities = matched
         if not matched_entities:
             return []
 
         chunk_scores: Dict[str, float] = {}
+        # visited (nombre, tabla) -> mejor profundidad ya explorada.
+        # Sin esto el DFS re-explora los mismos nodos por cada camino
+        # (p. ej. MSFT aparece vía varias entidades) y el coste se vuelve
+        # exponencial: 21s medidos en "¿En qué segmentos opera MSFT?".
+        visited: Dict[tuple[str, str], int] = {}
         for entity_name, entity_table in matched_entities:
             self._score_entity_hops(
-                conn, entity_name, entity_table, depth=1, chunk_scores=chunk_scores
+                conn, entity_name, entity_table, depth=1,
+                chunk_scores=chunk_scores, _visited=visited,
             )
 
         if not chunk_scores:
@@ -176,6 +185,12 @@ class GraphTraversalRetriever:
         ranked_ids = sorted(chunk_scores, key=chunk_scores.get, reverse=True)
         return self._fetch_chunks(conn, ranked_ids, chunk_scores, top_k)
 
+    # Topes solo como red de seguridad ante fan-out patológico (entidad
+    # hiper-conectada o decenas de entidades matcheadas). En consultas
+    # normales no se alcanzan y el resultado es idéntico al anterior.
+    _MAX_NEIGHBORS_PER_REL = 50
+    _MAX_VISITED_ENTITIES = 500
+
     def _score_entity_hops(
         self,
         conn: kuzu.Connection,
@@ -183,9 +198,25 @@ class GraphTraversalRetriever:
         entity_table: str,
         depth: int,
         chunk_scores: Dict[str, float],
+        _visited: Dict[tuple[str, str], int] | None = None,
     ) -> None:
         if depth > self.max_hops:
             return
+
+        if _visited is None:
+            _visited = {}
+        key = (entity_name, entity_table)
+        # Poda exacta: el score solo depende de la profundidad (1/depth, con
+        # max). Si ya se exploró este nodo a igual o menor profundidad, esta
+        # visita y todo su subárbol solo podrían asignar pesos <=, luego el
+        # max() no cambiaría. Solo se re-explora si se llega MÁS arriba.
+        best = _visited.get(key)
+        if best is not None and best <= depth:
+            return
+        if len(_visited) >= self._MAX_VISITED_ENTITIES:
+            logger.debug("Graph hop budget exhausted at %s (%s)", entity_name, entity_table)
+            return
+        _visited[key] = depth
 
         weight = self._depth_weight(depth)
         pk = _ENTITY_PK[entity_table]
@@ -216,14 +247,19 @@ class GraphTraversalRetriever:
                     MATCH (a:{entity_table})-[r:{rel}]->(b:{dst_table})
                     WHERE a.{pk} = $name
                     RETURN DISTINCT b.{dst_pk}
+                    LIMIT {self._MAX_NEIGHBORS_PER_REL}
                     """,
                     {"name": entity_name},
                 )
+                neighbors: List[str] = []
                 while result.has_next():
-                    row = result.get_next()
-                    neighbor = str(row[0])
+                    neighbors.append(str(result.get_next()[0]))
+                    if len(neighbors) >= self._MAX_NEIGHBORS_PER_REL:
+                        break
+                for neighbor in neighbors:
                     self._score_entity_hops(
-                        conn, neighbor, dst_table, depth + 1, chunk_scores
+                        conn, neighbor, dst_table, depth + 1, chunk_scores,
+                        _visited=_visited,
                     )
             except RuntimeError:
                 continue
