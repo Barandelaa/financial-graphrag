@@ -1,19 +1,180 @@
 # Financial GraphRAG Engine
 
-Sistema de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (las cuentas que las empresas cotizadas de EE. UU. presentan al regulador). Combina tres formas de recuperar información —**búsqueda vectorial densa, búsqueda léxica BM25 y grafo de conocimiento**— y genera respuestas con **citas a los fragmentos originales**. Con **dos agentes LangGraph** locales (`qwen3:8b`): determinista con **memoria Q/A** y **ReAct** con **10 tools** (retrieval RAG, métricas scoping, calculadora financiera, alta SEC, sugerencias de competidores con 10-K verificado, ficha corporativa y cotizaciones/noticias en tiempo real vía Finnhub API), **servidor web FastAPI con streaming SSE, barras de progreso de ingesta en vivo, cancelación cooperativa sin pérdida de datos e interfaz tipo ChatGPT** y tabla de métricas scoping `TICKER_YEAR`. La misma web se empaqueta como **app de escritorio Windows** con `desktop.py` (pywebview/WebView2) y `build_desktop.ps1` (PyInstaller).
+> Sistema local de **preguntas y respuestas financieras** sobre informes anuales **10-K de la SEC** (cuentas auditadas de empresas cotizadas de EE. UU.). 
+> Combina **búsqueda vectorial densa**, **búsqueda léxica BM25** y un **Grafo de Conocimiento**, generando respuestas con citas exactas a los fragmentos originales.
 
-Ejemplo de lo que responde:
+100% local con `qwen3:8b` (optimizado para GPUs de 12GB) o con fallback a Groq. Incluye interfaz web tipo ChatGPT con streaming en tiempo real y empaquetado para Windows (.exe).
+
+---
+
+## Índice rápido
+
+- [Ejemplos de lo que responde](#ejemplos-de-lo-que-responde)
+- [Inicio Rápido (Quickstart)](#inicio-rápido-quickstart)
+- [Formas de Uso](#formas-de-uso)
+  - [1. En el Navegador Web (Recomendado)](#1-en-el-navegador-web-recomendado)
+  - [2. App de Escritorio Windows (.exe)](#2-app-de-escritorio-windows-exe)
+  - [3. Terminal interactiva (CLI)](#3-terminal-interactiva-cli)
+  - [4. Como librería en Python](#4-como-librería-en-python)
+- [Cómo Funciona la Arquitectura](#cómo-funciona-la-arquitectura)
+- [Ingesta y Procesamiento (Chunking)](#ingesta-y-procesamiento-chunking)
+- [Construcción y Consulta del Grafo](#construcción-y-consulta-del-grafo)
+- [Estado de los Datos y Ontología](#estado-de-los-datos-y-ontología)
+- [Estructura del Proyecto y Stack](#estructura-del-proyecto-y-stack)
+- [Evaluación y Tests](#evaluación-y-tests)
+
+---
+
+## Ejemplos de lo que responde
 
 > **¿En qué segmentos opera MSFT?**
-> *Productivity and Business Processes, Intelligent Cloud y More Personal Computing* — con citas a los chunks `Item 7` / `Reportable Segments` y hechos del grafo (`MSFT --OPERATES_IN--> Intelligent Cloud`).
->
-> **What was AAPL revenue in 2024?**
-> *$391,035 million* — fila `| AAPL | 2024 | total net sales | 391035 USD millions | Item 8 | chunk_id |` scoping `AAPL_2024_total_net_sales`.
->
-> **¿A cuánto cotiza NVDA y qué noticias recientes hay?**
-> *$119.10 (+2.15 / +1.84%)* con titulares recientes filtrados por relevancia y enlaces directos vía Finnhub.
+> *Productivity and Business Processes, Intelligent Cloud y More Personal Computing* — con citas al fragmento `Item 7 / Reportable Segments` y hechos del grafo (`MSFT --OPERATES_IN--> Intelligent Cloud`).
 
-## Cómo funciona
+> **What was AAPL revenue in 2024?**
+> *$391,035 million* — con fila de tabla verificada: `| AAPL | 2024 | total net sales | 391035 USD millions | Item 8 | chunk_id |`.
+
+> **¿A cuánto cotiza NVDA y qué noticias recientes hay?**
+> *$119.10 (+1.84%)* con titulares financieros recientes y enlaces directos vía Finnhub API.
+
+---
+
+## Inicio Rápido (Quickstart)
+
+### 1. Clonar e instalar dependencias
+
+```bash
+git clone <repo-url>
+cd financial-graphrag
+
+# Crear y activar entorno virtual
+python -m venv .venv
+
+# En Windows:
+.\.venv\Scripts\activate
+# En Linux/macOS:
+# source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+### 2. Configurar el LLM (`.env`)
+
+Crea un archivo `.env` en la raíz (puedes basarte en la plantilla):
+
+```bash
+# Opción A (Por defecto): Ollama local (100% privado y gratuito)
+ollama pull qwen3:8b
+
+# Opción B (Fallback opcional): Groq en la nube
+GROQ_API_KEY="gsk_..."
+
+# Datos de mercado y noticias en tiempo real (gratuito en https://finnhub.io):
+FINNHUB_API_KEY="c1...x9"
+
+# Opcional (acelera descarga de embeddings bge-m3):
+HF_TOKEN="hf_..."
+```
+
+---
+
+## Formas de Uso
+
+Elige la forma de interactuar que más te convenga:
+
+### 1. En el Navegador Web (Recomendado)
+
+Una aplicación web completa estilo ChatGPT: historial de conversaciones en disco, tokens en tiempo real (streaming SSE), barras de progreso e interacción con confirmaciones humanas (HITL).
+
+**Paso 1:** Arranca el servidor local:
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
+```
+*(Al arrancar tarda algo menos de 1 minuto en calentar los modelos y mostrará el aviso `API lista`)*.
+
+**Paso 2:** Abre tu navegador favorito y entra en:
+**`http://localhost:8000`**
+
+---
+
+### 2. App de Escritorio Windows (.exe)
+
+Puedes usar la aplicación en una ventana nativa de Windows sin abrir el navegador:
+
+* **Modo desarrollo:**
+  ```powershell
+  .\.venv\Scripts\python.exe desktop.py
+  ```
+* **Compilar un único archivo ejecutable (`.exe` independiente):**
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File build_desktop.ps1
+  # Genera: dist\FinancialGraphRAG.exe (~1.5 GB empaquetado)
+  ```
+  **Al hacer doble clic en el `.exe`**:
+  - Crea solo sus carpetas (`data/`, `logs/`) y restaura los datos base.
+  - Si falta Ollama o el modelo, abre una ventana de bienvenida y descarga `qwen3:8b` automáticamente.
+  - Incluye bloqueo de instancia única para evitar corromper la base de datos de grafos.
+
+---
+
+### 3. Terminal interactiva (CLI)
+
+Ideal para desarrolladores que prefieren la consola:
+
+```bash
+# Agente ReAct (el modelo razona y elige entre 10 herramientas + streaming en vivo)
+python cli.py --react
+
+# Agente determinista estructurado
+python cli.py
+
+# Ingesta manual directa sin agente
+python cli.py --ingest --ticker AAPL --year 2024
+```
+
+**Comandos útiles dentro del chat:**
+- `<pregunta>`: Consulta RAG directa (ej: *¿Cuáles fueron los ingresos de Amazon en 2024?*).
+- `¿y en 2023?`: Pregunta de seguimiento que reutiliza el contexto del ticker anterior.
+- `/ingest <ticker> <año>`: Descarga e indexa un informe 10-K en caliente.
+- `/clear`: Limpia la memoria de la conversación actual.
+- `/exit`: Salir.
+
+---
+
+### 4. Como librería en Python
+
+Puedes integrar el pipeline o los agentes directamente en tus propios scripts:
+
+```python
+from src.llm_factory import create_llm
+from src.pipeline import FinancialGraphRAGPipeline
+
+# 1. Pipeline directo
+llm = create_llm()
+pipeline = FinancialGraphRAGPipeline(llm=llm, graph_max_workers=2, graph_batch_size=1)
+
+# Ingesta y consulta
+pipeline.ingest_and_index(ticker="AAPL", year=2024)
+res = pipeline.query("What was AAPL revenue in 2024?")
+
+print("Respuesta:", res.answer)
+print("Citas:", res.citations)
+print("Tabla de métricas:", res.metrics_rows)
+pipeline.close()
+
+# 2. Agente ReAct con LangGraph
+from src.agent.react_graph import build_react_agent
+from langchain_core.messages import HumanMessage
+
+agent = build_react_agent(pipeline)
+respuesta = agent.invoke(
+    {"messages": [HumanMessage(content="Compara el margen operativo de MSFT y AAPL")]},
+    config={"configurable": {"thread_id": "mi_chat_1"}}
+)
+```
+
+---
+
+## Cómo Funciona la Arquitectura
 
 ```
 SEC EDGAR 10-K (PDF/HTML)             Finnhub REST API (en vivo)
@@ -32,304 +193,136 @@ Ingesta: PDF/HTML → Markdown → secciones  ┌──────────�
                       ▼                                             │
         Dos modos de agente (100% local, memoria Q/A):              │
         A) Determinista: classify_intent → ingest_tool HITL | retrieve
-        B) ReAct (--react y web API): el modelo decide tools
-           tools: query_financial_rag | lookup_metrics | financial_calculator
-                  propose_new_company | add_company_to_config (HITL 1) | ingest_10k (HITL 2)
-                  stock_price | company_news | suggest_companies | lookup_company
-           HITL moderno nativo con interrupt() dentro de las tools y reanudación con Command(resume=...)
-           Filtro de preámbulo JSON en streaming (JsonPrefaceFilter)
-           Canales: CLI interactivo y Servidor Web FastAPI (SSE + barras de progreso + cancelación + historial)
-        retrieve: expanded query (revenue→net sales) → dense/sparse/graph+metrics_table scoping
-        RRF (k=60) → grounding por ticker → dedup
-                    → reranker cross-encoder (bge-reranker-v2-m3)
-                    → VRAM empty_cache antes de generación
+        B) ReAct (--react y web API): el modelo decide herramientas
+           10 tools: query_rag | lookup_metrics | calculator | propose_company
+                     add_company (HITL 1) | ingest_10k (HITL 2) | stock_price
+                     company_news | suggest_companies | lookup_company
                       ▼
-        LLM + generación con citas + graph facts + METRICS TABLE
-        (OPERATES_IN/COMPETES_WITH como facts; métricas como tabla | ticker | year | metric | value |)
-        Alta de empresas: universo oficial SEC (company_tickers.json) + verificación 10-K en EDGAR,
-        sin mapas curados; ticker literal exacto → vía rápida, resto → pregunta al usuario
+        Recuperación Híbrida:
+        Query Expansion → Prefilter por Ticker → Búsqueda paralela (Densa + BM25 + Grafo)
+        → Fusión RRF (k=60) → Re-ranking con Cross-Encoder (bge-reranker-v2-m3)
+                      ▼
+        Generación final con LLM + Citas a fragmentos + TABLA DE MÉTRICAS
 ```
 
-1. **Ingesta** (`src/ingestion/`): descarga el 10-K, lo pasa a Markdown (tablas HTML → `| col |`), lo trocea **table-aware** (no parte filas `| | |`) con metadatos (`ticker`, `año`, `sección`, `página`) y lo guarda en `data/processed_chunks/<TICKER>_<AÑO>/chunks.json` (table-aware desde el último rebuild).
-2. **Grafo** (`src/graph/`): LLM (`qwen3:8b` `reasoning=False, format=json, num_ctx 8192`) extrae tripletas `(origen, relación, destino)` con `value/unit/year` para `FinancialMetric` según ontología. PK de métrica es **compuesta** `TICKER_YEAR_slug` (`AAPL_2024_total_net_sales`) con columna `year` inferida por prompt few-shot (`2024 | 2023` → 2 triplets) + fallback regex por proximidad. Se cachea en `triplets.json`, se normalizan tickers (`Apple→AAPL`, `AM,ZN→AMZN`), se filtran ruidos y se persiste en **Kùzu** con `MERGE + seen-set`.
-3. **Recuperación** (`src/retrieval/`): cada pregunta pasa por `expand_query` sinónimos, consulta los tres índices en paralelo + `MetricsTable` scoping (`c.ticker IN $tickers AND m.id CONTAINS '_'`), fusiona con **RRF**, filtra por ticker, dedup, reordena con **cross-encoder** y genera con **citas** (`CHUNK_ID` + `METRICS TABLE` con `section`).
-4. **Agentes** (`src/agent/`):
-   - **Determinista**: `StateGraph` `classify_intent (with_structured_output IntentOutput ingest|retrieve) → parallel_retrieve → fuse_rerank (torch.cuda.empty_cache) → generate`. `ingest_10k(ticker,year)` con **HITL** `MemorySaver interrupt_before ingest_tool` y confirmación `y/n` en CLI. Memoria conversacional solo `Q/A` (no chunks, `4×500 chars`).
-   - **ReAct** (`--react`, `react_graph.py`, system prompt en inglés para `qwen3:8b`): `create_react_agent` con **10 tools** — `query_financial_rag` (retrieval completo), `lookup_metrics` (cifras scoping), `financial_calculator` (`yoy_pct|pct_change|diff|ratio|sum|avg`), `propose_new_company` (universo SEC + 10-K EDGAR), `add_company_to_config` (**HITL 1**: editar `companies.json` con `.bak`), `ingest_10k` (**HITL 2**: ingesta con progreso y cancelación cooperativa), `stock_price` (cotización en tiempo real vía Finnhub), `company_news` (noticias financieras con enlaces directos), `suggest_companies` (sugiere hasta 5 candidatas competidoras con 10-K verificado en EDGAR) y `lookup_company` (ficha corporativa con bolsa, capitalización y estado del 10-K). HITL nativo vía `interrupt()` y `Command(resume=...)`. Saneamiento de historial ante cancelaciones con `_repair_dangling_tool_calls`.
-   - **Alta de empresas** (`company_registry.py`, sin mapas curados): universo oficial SEC cacheado (`data/sec/company_tickers.json`, TTL 30 días) + difusa `difflib`; ticker literal exacto → vía rápida sin pregunta; resto → candidatos y pregunta obligatoria al usuario antes de buscar documentos; índices/filiales sin 10-K se explican y no se dan de alta. Las listas de tickers de ingesta/retrieval/grafo se construyen desde `companies.json` + universo SEC.
-5. **Evaluación** (`evals/`): `51 Q/A` (15 viejas fuera de corpus `2023` + 36 nuevas `2024-2025` YoY `revenue/segments/risks`) y checks deterministas `answer, citas, ticker/año/sección, dense/sparse/graph, metrics_scoping` con gate `0.85` (sin LLM-juez local).
+### Componentes principales:
 
-## Estado actual de los datos
+1. **Recuperación Híbrida en 3 Vías**:
+   - **Densa:** Vectores de 1024 dimensiones con `bge-m3` en **LanceDB** (almacenamiento en disco NVMe).
+   - **Léxica:** Índice invertido **BM25** para palabras clave exactas.
+   - **Grafo:** Recorridos por saltos en **Kùzu Graph DB** para hechos estructurales.
+2. **Fusión y Re-ranking**:
+   - Los resultados se combinan mediante **Reciprocal Rank Fusion (RRF)**.
+   - Se reordenan los mejores candidatos con un **Cross-Encoder** (`bge-reranker-v2-m3`) para máxima precisión semántica.
+3. **Agentes Inteligentes (LangGraph)**:
+   - **10 Herramientas ReAct**: Consulta RAG, calculadora matemática financiera, registro oficial SEC, cotizaciones en vivo y noticias.
+   - **Human-in-the-Loop (HITL) nativo**: Acciones sensibles (editar empresas seguidas o descargar 10-Ks) se pausan con `interrupt()` y esperan la confirmación del usuario con botones en la web o `y/n` en la consola.
+   - **Auto-reparación de historial**: Si el usuario cancela un turno a mitad de proceso, el sistema inyecta mensajes sintéticos para evitar que LangGraph falle por llamadas huérfanas.
 
-Empresas `data/companies.json` `2024–2025`: `AAPL, MSFT, AMZN, GOOGL, NVDA, META, TSLA, BRK.B`.
+---
 
-* **Ingesta completa tabla-aware 2026-09-09:** `3067` chunks (`129-292` por filing, antes `1700`), `~19k` tripletas en cache.
-* **Grafo (tras limpieza 5180 viejos):** `7907` `FinancialMetric` (`7837` con `value`, `id` scoping), `Company 216`, `BusinessSegment ~1273`, `216` `COMPETES_WITH`-like; `DocumentChunk 3067`; `REPORTED_METRIC 7923`, `OPERATES_IN ~1380`, `MENTIONS_EVENT ~2038`. `AMZN_2024` y `MSFT_2025` ya sin huecos.
-* **Vector:** `LanceDB 1928→3067 rows`, `BM25` rebuild desde Lance, `bge-m3` + `bge-reranker-v2-m3`.
+## Ingesta y Procesamiento (Chunking)
 
-> **Aviso:** El contenido generado de `data/` (`10-K`, `chunks`, `lancedb`, `kuzu_db`) no está en el repo (`.gitignore`) y pesa `>500 MB` (solo se incluye la configuración inicial `data/companies.json`). Al clonar, `python cli.py --ingest --workers 4 --batch-size 1` tarda horas (extracción `workers 4 batch 1` + `reasoning=False` es el path estable para 12GB), los workers y batches dependerán del hardware. `docs/` (tutoriales y apuntes locales) también está ignorado (`.gitignore`).
+Los informes anuales 10-K contienen tablas financieras críticas. Un troceado ciego rompería las filas y mezclaría números con conceptos erróneos.
 
-## Instalación
+1. **Descarga oficial:** `sec-edgar-downloader` obtiene el documento oficial de la SEC (`full-submission.txt`).
+2. **Conversión a Markdown:** Detecta tablas HTML con `beautifulsoup4` y las convierte a formato Markdown (`| col1 | col2 |`).
+3. **División por secciones:** Detecta encabezados reglamentarios (`Item 1`, `Item 1A Riesgos`, `Item 7 MD&A`, `Item 8 Estados Financieros`).
+4. **Chunking Table-Aware:**
+   - Trocea el texto en bloques de unas ~600 palabras con solape de 90 palabras.
+   - **Las tablas nunca se cortan por la mitad**: se procesan como bloques íntegros o se dividen fila por fila conservando las cabeceras.
+5. **IDs deterministas:** Cada fragmento recibe un ID único por hash SHA-1 (`ticker/año/sección/página/seq`), evitando duplicados al reprocesar.
 
-```bash
-git clone <repo-url>
-cd financial-graphrag
+---
 
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux/macOS:
-# source .venv/bin/activate
+## Construcción y Consulta del Grafo
 
-pip install -r requirements.txt  # incluye langchain, langgraph
-```
+### Extracción de Tripletas
+Cada fragmento pasa por `qwen3:8b` para extraer conocimiento estructurado según una ontología cerrada:
+- **5 Entidades:** `Company`, `FinancialMetric`, `RiskFactor`, `BusinessSegment`, `MacroEvent`.
+- **5 Relaciones:** `OPERATES_IN`, `REPORTED_METRIC`, `IMPACTS_REVENUE`, `MITIGATES_RISK`, `COMPETES_WITH`.
 
-Configuración LLM (`.env`):
+### Scoping de Métricas (Claves compuestas)
+Para evitar que una cifra de ingresos de Apple colisione con una de Microsoft, cada métrica genera un ID único con ámbito:
+$$\texttt{AAPL\_2024\_total\_net\_sales} \quad \text{vs} \quad \texttt{MSFT\_2024\_total\_net\_sales}$$
+Las cifras fiables para la generación se consultan directamente mediante **tablas Markdown estructuradas**, garantizando que el LLM nunca confunda años o empresas.
 
-```bash
-# Opción 1 (por defecto): Ollama local
-ollama pull qwen3:8b        # DEFAULT_OLLAMA_MODEL = "qwen3:8b" (reasoning=False, format=json, num_ctx 8192)
-# Para 12GB: OLLAMA_NUM_PARALLEL=2
+---
 
-# Opción 2 fallback si Ollama no responde: Groq
-export GROQ_API_KEY="gsk_..."
-# Opcional HF_TOKEN para bge-m3
-export HF_TOKEN="hf_..."
-# Datos de mercado y noticias (tools stock_price y company_news del agente ReAct):
-# key gratuita en https://finnhub.io/register (60 llamadas/minuto)
-export FINNHUB_API_KEY="c1...x9"
-```
+## Estado de los Datos y Ontología
 
-> `create_llm()` usa Ollama y cae a Groq. Generación/extracción requieren LLM; `dense/BM25/grafo` funcionan con índice ya construido.
+### Resumen del Corpus Indexado:
+Empresas seguidas en `data/companies.json` (ejercicios 2024–2025):  
+`AAPL, MSFT, AMZN, GOOGL, NVDA, META, TSLA, BRK.B, DELL, FLNC`.
 
-## Uso
-
-### Chat interactivo (CLI con agente)
-
-```bash
-python cli.py                          # agente LangGraph determinista + memoria Q/A
-python cli.py --react                  # agente ReAct (el modelo decide tools) + doble HITL
-python cli.py --no-agent               # pipeline directo sin agente
-python cli.py --workers 2 --batch-size 1  # estable 12GB (default 4→2)
-python cli.py --ticker AAPL --year 2024
-python cli.py --ingest
-```
-
-Dentro del chat:
-
-```
-<pregunta>             -> retrieval RAG (ej: What was AAPL revenue in 2024?)
-¿y en 2023?            -> follow-up usa memoria (history_ticker AAPL)
-añade AAPL 2026        -> clasifica ingest → ¿Confirmas ingesta AAPL 2026? (y/n) → HITL Tool
-I want to know about nasdaq / Fluence Energy  -> (modo --react) propone alta vía SEC → ¿Confirmas editar companies.json? (y/n) → ¿Confirmas ingesta? (y/n)
-/ingest <ticker> <año> -> ingesta directa sin agente
-/ingest-all            -> data/companies.json
-/clear                 -> limpia memoria conversacional (nuevo thread_id)
-/help, /exit
-```
-
-La ingesta del agente usa los mismos `workers/batch` del arranque (van con el pipeline, no son propios del agente). El alta escribe `companies.json` dejando backup `companies.json.bak`.
-
-En modo `--react`, el CLI implementa **streaming en tiempo real** (`stream_mode="messages"`): anuncia dinámicamente cada herramienta al invocarse (`>> tool_name...`) y emite los tokens de respuesta en vivo, coordinándose con `Command(resume=...)` cuando salta un `interrupt()`. La arquitectura interna del CLI desacopla los comandos con una tabla de despacho (`_COMMANDS`) y un registro extensible de avisos (`INTERRUPT_HANDLERS`).
-
-Cada respuesta muestra `[Facts: N | Metrics: N | Citations: N]` (truncado a 5), citas `chunk_id/ticker/año/sección/score` y `METRICS TABLE` scoping si aplica.
-
-### API web local (FastAPI + página mínima, agente ReAct con streaming)
-
-```bash
-.venv/Scripts/python.exe -m pip install -r requirements.txt  # fastapi + uvicorn[standard]
-.venv/Scripts/python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
-# Abrir http://localhost:8000
-```
-
-Sin `--reload` a propósito: recargar duplicaría el modelo en VRAM. Un solo pipeline/agente compartidos (`GRAPH_WORKERS=2` opcional, por defecto 2); Kuzu es un solo escritor y los turnos se serializan con lock.
-
-Endpoints (`api.py`):
-
-| Método | Ruta | Descripción |
+| Componente | Volumen Actual | Detalle técnico |
 |---|---|---|
-| `GET` | `/health` | `{status, model, tickers}` |
-| `GET` | `/` | Chat SPA (`static/index.html`): sidebar de chats, tokens en vivo, barras de progreso por año, botón Detener, tarjetas HITL |
-| `POST` | `/query {question, thread_id?}` | SSE (`start` / `token` / `tool` / `progress` / `interrupt` / `cancelled` / `done` / `error`) con el bucle ReAct del CLI |
-| `POST` | `/confirm {thread_id, decision}` | Reanuda con `Command(resume=...)` tras un `interrupt` (`confirm_add_company`, `confirm_ingest`) |
-| `POST` | `/cancel {thread_id}` | Detiene cooperativamente una ingesta en curso guardando el progreso en disco para retomarla después |
-| `GET` | `/conversations` | Lista conversaciones guardadas en `data/conversations.json` ordenadas por fecha |
-| `GET` | `/conversations/{thread_id}` | Obtiene el historial completo de mensajes y título de un thread |
-| `DELETE` | `/conversations/{thread_id}` | Elimina una conversación del almacenamiento |
+| **Document Chunks** | **4.165 fragmentos** | 20 informes 10-K completos (10 empresas × 2 años) |
+| **Tripletas extraídas** | **~33.689 tripletas** | Persistidas en caché incremental `triplets.json` |
+| **Nodos en Grafo Kùzu** | **~17.200 nodos** | 15.491 métricas, 1.251 segmentos, 422 empresas |
+| **Aristas en Grafo** | **~17.600 relaciones** | 15.586 métricas reportadas, 1.399 segmentos |
+| **Vectores en LanceDB** | **4.165 vectores** | Embeddings `bge-m3` con índices escalares BTREE |
 
-**Progreso y Cancelación Cooperativa**:
-- Durante la ingesta de un 10-K, el pipeline emite eventos SSE `progress` (`download`, `parse`, `cache`, `extract`, `index`, `done`) que dibujan una barra de porcentaje en tiempo real por cada par `ticker/año`.
-- Si el usuario pulsa **Detener** (`POST /cancel`), el backend eleva `IngestCancelled` (que hereda de `BaseException` para no ser capturada por reintentos de red), **cancela las tareas pendientes y sincroniza en disco las tripletas calculadas hasta ese segundo**.
-- Al pedir *"continúa la ingesta"*, el sistema detecta los chunks ya persistidos en `triplets.json` y continúa sin repetir trabajo.
-- Para evitar que cancelaciones abruptas dejen `tool_calls` sin resolver (lo que causaría un fallo `INVALID_CHAT_HISTORY` en LangGraph), `api.py` repara automáticamente el historial inyectando un `ToolMessage` sintético de cancelación antes del siguiente turno (`_repair_dangling_tool_calls`).
-- Las conversaciones se persisten en disco de forma atómica y segura entre hilos (`data/conversations.json`). Al reiniciar el servidor API, el historial se reinyecta automáticamente en el `MemorySaver` de LangGraph.
+> **Nota:** Las carpetas con datos generados (`data/raw_10k/`, `data/processed_chunks/`, `data/graph/`, `data/vector_store/`) están excluidas del repositorio (`.gitignore`) para evitar subir cientos de megabytes. Al clonar el repositorio, se incluye la configuración inicial limpia en `data/companies.json`.
 
-```bash
-curl -N -X POST localhost:8000/query -H "Content-Type: application/json" -d "{\"question\":\"¿a cuánto cotiza AAPL?\"}"
-curl -X POST localhost:8000/confirm -H "Content-Type: application/json" -d "{\"thread_id\":\"...\",\"decision\":\"y\"}"
-curl -X POST localhost:8000/cancel -H "Content-Type: application/json" -d "{\"thread_id\":\"...\"}"
-```
+---
 
-### App de escritorio Windows (pywebview)
-
-Reutiliza la web tal cual: `desktop.py` levanta `api.py` en un hilo uvicorn y abre `static/index.html` en una ventana nativa (WebView2, sin Chrome extra). Sin cambios en el frontend (usa rutas relativas).
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt  # incluye pywebview
-.\.venv\Scripts\python.exe desktop.py
-# Variables opcionales: DESKTOP_PORT=8000, DESKTOP_WIDTH=1220, DESKTOP_HEIGHT=820, DESKTOP_DEBUG=1
-```
-
-Notas:
-- Sin `--reload` a propósito (igual que la API): no duplica el modelo en VRAM. El arranque puede tardar 1-3 min (bge-m3 + reranker + qwen3:8b).
-- Al cerrar la ventana se apaga uvicorn (guarda Kuzu/LanceDB limpiamente). No abras dos instancias a la vez (Kuzu = un solo escritor).
-- Requisitos en el PC que la ejecuta: Ollama con `ollama pull qwen3:8b`, WebView2 (preinstalado en Win10/11) y `.env` con `FINNHUB_API_KEY` opcional.
-
-Generar `.exe` auto-bootstrap (un solo ejecutable independiente, con consola para ver logs):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File build_desktop.ps1
-# genera: dist\FinancialGraphRAG.exe (un solo archivo empaquetado)
-```
-
-**Mecanismo de Auto-Bootstrap al hacer doble clic**:
-1. **Directorios y datos**: Si faltan, crea automáticamente las carpetas `data/`, `logs/` y restaura `data/companies.json` y la plantilla `.env` junto al `.exe` a partir de los datos empaquetados en el binario.
-2. **Asistente de configuración inicial**: Si no hay claves en `.env` o no detecta Ollama, muestra una ventana de bienvenida para introducir `FINNHUB_API_KEY`, `HF_TOKEN` y enlaces directos para instalar Ollama o descargar `qwen3:8b`.
-3. **Descarga asistida del modelo**: Si detecta que Ollama está en ejecución pero falta el modelo local, ejecuta automáticamente `ollama pull qwen3:8b` en segundo plano.
-4. **Protección de instancia única**: Bloquea la apertura accidental de múltiples instancias con un lock de socket local (`127.0.0.1:8765`), garantizando que la base de datos monoproceso Kùzu no se corrompa.
-5. **Resolución robusta de frontend**: `api.py:index()` busca `static/index.html` de forma adaptable en `sys._MEIPASS` (extracción temporal del onefile), junto al ejecutable o en el directorio de trabajo.
-
-### Desde Python
-
-```python
-from src.llm_factory import create_llm
-from src.pipeline import FinancialGraphRAGPipeline
-
-llm = create_llm()  # reasoning=False
-pipeline = FinancialGraphRAGPipeline(llm=llm, graph_max_workers=2, graph_batch_size=1)
-pipeline.ingest_and_index(ticker="AAPL", year=2024)  # use_cache=False para re-extraer con year
-result = pipeline.query("Which segments does MSFT operate in?")
-print(result.answer)
-print(result.citations)
-print(result.metrics_rows)  # scoping
-pipeline.close()
-
-# Agente directo
-from src.agent.graph import build_agent_graph
-agent = build_agent_graph(pipeline)
-agent.invoke({"question": "What was AAPL revenue in 2024?"}, config={"configurable":{"thread_id":"t1"}})
-
-# Agente ReAct (10 tools + doble HITL)
-from src.agent.react_graph import build_react_agent
-from langchain_core.messages import HumanMessage
-react = build_react_agent(pipeline)  # usa create_llm(json_mode=False) para tool_calls
-react.invoke({"messages": [HumanMessage(content="YoY de AAPL revenue 2024 vs 2023")]},
-             config={"configurable": {"thread_id": "t2"}})
-```
-
-### Reprocesar huecos
-
-```bash
-python reprocess_missing.py --workers 2 --batch-size 1
-# detecta triplets parciales (cached_ids < len(chunks)) y fuerza re-ingesta si chunks vacío (AMZN_2024)
-```
-
-### Evaluación y tests
-
-```bash
-python evals/run_checks.py --samples 5            # gate 0.85, 9 checks (+metrics_scoping)
-python evals/run_checks.py                         # 51 Q/A (~6 min con qwen3:8b)
-& ".\.venv\Scripts\python.exe" evals/run_checks.py # en Windows con .venv
-# pytest opcional (no en requirements por defecto)
-pip install pytest && python -m pytest tests/ -v
-```
-
-## Estructura del repositorio
+## Estructura del Proyecto y Stack
 
 ```
 financial-graphrag/
-├── api.py                      # Servidor FastAPI (SSE streaming, progreso, HITL wait/resume, cancelación, CRUD historial; index() adaptable a .exe)
-├── cli.py                      # REPL agente LangGraph (Streaming en vivo, Dispatch table, HITL Command(resume=...))
-├── desktop.py                  # App escritorio Windows: uvicorn en hilo + ventana pywebview/WebView2 + setup inicial
-├── build_desktop.ps1           # Genera dist\FinancialGraphRAG.exe con PyInstaller (--onefile, --console, auto-bootstrap)
-├── reprocess_missing.py        # Detecta faltantes/parciales y ingesta con workers/batch (soporta reanudar/limpio con locks)
+├── api.py                      # Servidor FastAPI (SSE streaming, progreso, HITL, cancelación, chats)
+├── desktop.py                  # Lanzador escritorio Windows (ventana nativa pywebview/WebView2)
+├── build_desktop.ps1           # Script de empaquetado para generar FinancialGraphRAG.exe
+├── cli.py                      # Interfaz interactiva de consola (CLI con streaming)
+├── reprocess_missing.py        # Detección y reanudación de huecos de ingesta
 ├── static/
-│   └── index.html              # Frontend Web SPA (ChatGPT-style, SSE, barras de progreso por año, botón Detener, tarjetas HITL)
-├── data/                       # Datos y persistencia
-│   ├── companies.json          # Registro de empresas seguidas (con .bak automático)
-│   ├── conversations.json      # Historial persistente de chats (atómico / thread-safe)
-│   ├── raw_10k/                # full-submission.txt + .download_cache.json (ignorado)
-│   ├── processed_chunks/       # chunks.json + triplets.json (PK TICKER_YEAR_metric, ignorado)
-│   ├── vector_store/lancedb/   # LanceDB bge-m3 (ignorado)
-│   └── graph/kuzu_db/          # Kuzu DB (ignorado)
+│   └── index.html              # Frontend web SPA (estilo ChatGPT, SSE, barras de progreso)
+├── data/
+│   └── companies.json          # Lista de empresas seguidas (AAPL, MSFT, NVDA...)
 ├── src/
-│   ├── bootstrap.py            # Auto-bootstrap para .exe: crea carpetas/data/.env, chequea/pull Ollama, lock de instancia única
-│   ├── agent/                  # Determinista + ReAct (100% local)
-│   │   ├── state.py            # AgentState (messages Q/A, no chunks)
-│   │   ├── tools.py            # 10 tools ReAct + interrupt() nativo + calculator + SEC registry + Finnhub + suggestions
-│   │   ├── progress.py         # Monitor de progreso por thread, cancelación cooperativa IngestCancelled y suscripción SSE
-│   │   ├── market_data.py      # Cliente Finnhub (cotizaciones, noticias, peers, perfiles, resolución URLs, caché 60s)
-│   │   ├── history_store.py    # Persistencia JSON atómica de conversaciones + reinyección en LangGraph
-│   │   ├── company_registry.py # Universo oficial SEC + resolve difuso + verify_10k EDGAR + add_company (.bak)
-│   │   ├── nodes.py            # classify_intent with_structured_output + parallel_retrieve + fuse_rerank + generate + history
-│   │   ├── graph.py            # StateGraph determinista + MemorySaver interrupt_before ingest_tool
-│   │   └── react_graph.py      # create_react_agent (prompt EN) + MemorySaver (HITL nativo vía interrupt() en tools)
-│   ├── env.py                  # Carga de variables de entorno (.env)
-│   ├── llm_factory.py          # ChatOllama qwen3:8b reasoning=False (json_mode=True → format=json; False → tool_calls nativos)
-│   ├── pipeline.py             # FinancialGraphRAGPipeline
-│   ├── ingestion/              # downloader, parser (HTML tables → | |), chunker table-aware, pipeline (reporta progreso)
-│   ├── graph/                  # schema, extractor, graph_pipeline (PK compuesto, checkpoints incrementales y progreso)
-│   └── retrieval/              # dense, sparse, graph_traversal, graph_facts, metrics_table scoping, rrf, reranker, generator
-├── evals/
-│   ├── test_dataset.json       # 51 Q/A (2024-2025 YoY)
-│   └── run_checks.py           # 9 checks + gate 0.85 + metrics scoping
-└── tests/
+│   ├── bootstrap.py            # Inicialización autónoma para el .exe (crea carpetas y descarga modelo)
+│   ├── env.py                  # Gestión de variables de entorno (.env)
+│   ├── llm_factory.py          # Factoría de modelos (Ollama local / Groq fallback)
+│   ├── pipeline.py             # Pipeline unificado de FinancialGraphRAG
+│   ├── agent/                  # Agentes LangGraph (ReAct 10 tools, determinista, progreso, historial)
+│   ├── ingestion/              # Descarga de la SEC, parser HTML/PDF y chunker table-aware
+│   ├── graph/                  # Extracción de tripletas, ontología y persistencia en Kùzu DB
+│   └── retrieval/              # Búsqueda híbrida (densa, dispersa, grafo), RRF y re-ranking
+└── evals/                      # Suite de 51 pruebas deterministas con gate de calidad 0.85
 ```
 
-## Ontología del grafo
+### Tecnologías Principales (Stack):
 
-| Nodo | Clave | Descripción |
-|---|---|---|
-| `Company` | `ticker` | `AAPL, BRK.B` canónico |
-| `FinancialMetric` | `id = TICKER_YEAR_slug` | Métrica scoping `AAPL_2024_total_net_sales` con `value/unit/fiscal_year` |
-| `RiskFactor` | `id` | Riesgo Item 1A |
-| `BusinessSegment` | `id` | Segmento reportable |
-| `MacroEvent` | `id` | Evento macro |
-| `DocumentChunk` | `chunk_id` | `ticker/año/sección/página` |
-
-| Relación | Origen → Destino |
+| Capa | Herramienta |
 |---|---|
-| `OPERATES_IN` | Company → BusinessSegment |
-| `REPORTED_METRIC` | Company → FinancialMetric (scoping) |
-| `IMPACTS_REVENUE` | MacroEvent → FinancialMetric |
-| `MITIGATES_RISK` | BusinessSegment → RiskFactor |
-| `COMPETES_WITH` | Company → Company |
-| `MENTIONS_*` | DocumentChunk → entidad |
+| **Lenguaje** | Python 3.10+ |
+| **LLM Local** | Ollama (`qwen3:8b`, reasoning=False, context=8192) con fallback a Groq |
+| **Orquestación de Agentes** | LangChain & LangGraph (ReAct con ToolNode y `interrupt()`) |
+| **Embeddings & Reranker** | BAAI/bge-m3 & BAAI/bge-reranker-v2-m3 |
+| **Base de Datos Vectorial** | LanceDB (formato columnar Apache Arrow sobre disco) |
+| **Base de Datos de Grafos** | Kùzu DB (grafo de propiedades embebido ultrarrápido) |
+| **Búsqueda Léxica** | BM25 (`rank-bm25`) |
+| **Web & API** | FastAPI, Uvicorn, Server-Sent Events (SSE) |
+| **Escritorio Windows** | `pywebview` (Microsoft Edge WebView2) y PyInstaller |
+| **Datos Financieros en Vivo** | Finnhub REST API y SEC EDGAR |
 
-Notas:
+---
 
-* `FinancialMetric` ya no colisiona (`revenue` → `AAPL_2024_revenue` vs `MSFT_2024_revenue`) y tablas `2024|2023` generan 2 triplets con `year` por columna (prompt few-shot + fallback regex). `GENERATION` usa `METRICS TABLE scoping` no `graph_facts` para cifras.
-* `chunker` respeta `| tablas |` y `parser` convierte `HTML <table>` a `| col |`.
+## Evaluación y Tests
 
-## Stack
+El proyecto incluye una suite de evaluación determinista de **51 preguntas reales** de balances (márgenes, ventas YoY, riesgos y segmentos):
 
-| Componente | Tecnología |
-|---|---|
-| Lenguaje | Python 3.10+ |
-| Ingesta | sec-edgar-downloader, pdfplumber, markdownify, unstructured, bs4 |
-| Embeddings | BAAI/bge-m3 (sentence-transformers) |
-| Vector store | LanceDB |
-| Léxico | BM25 (rank-bm25) |
-| Grafo | Kùzu (MERGE scoping) |
-| LLM | Ollama `qwen3:8b` `reasoning=False, num_ctx 8192` (`format=json` en determinista/extractor; `tool_calls` nativos en ReAct) → Groq fallback |
-| Framework | LangChain / LangGraph (StateGraph determinista + ReAct `create_react_agent`, ToolNode HITL) |
-| Web API & UI | FastAPI, Uvicorn, Server-Sent Events (SSE), HTML5/Tailwind/CSS |
-| App escritorio | pywebview (WebView2 en Windows) + PyInstaller (`desktop.py`, `build_desktop.ps1`) |
-| APIs Externas | Finnhub REST API (cotizaciones en tiempo real, noticias financieras) |
-| Reranker | BAAI/bge-reranker-v2-m3 |
-| Comunidades | Leiden + igraph + networkx |
-| Evaluación | Checks deterministas gate 0.85 + metrics_scoping (`evals/run_checks.py`) |
+```bash
+# Ejecutar verificación rápida (5 muestras):
+python evals/run_checks.py --samples 5
+
+# Ejecutar la suite completa de 51 pruebas (gate de calidad 0.85):
+python evals/run_checks.py
+```
+
+---
 
 ## Licencia
 
-MIT
+MIT License. Creado con fines de investigación, análisis financiero y desarrollo de agentes avanzados de IA.
